@@ -63,7 +63,38 @@ Pour chaque application (24 modules disponibles), l'API implémente trois types 
 
 ---
 
-## 🚑 6. Aide au dépannage (Troubleshooting)
+## 🔐 6. Authentification & Connexion des Utilisateurs (`/login`)
+
+L'API fournit un endpoint universel permettant aux utilisateurs Odoo de Capsy de s'authentifier de manière dynamique :
+
+*   **Endpoint** : `/login`
+*   **Méthode** : `POST`
+*   **Payload** :
+    ```json
+    {
+      "username": "email@example.com",
+      "password": "mot_de_passe_ou_cle_api",
+      "db": "capsy1-test-gerard", // Optionnel (prend la valeur du .env par défaut)
+      "url": "https://capsy1-test-gerard.odoo.com" // Optionnel (prend la valeur du .env par défaut)
+    }
+    ```
+*   **Réponse en cas de succès (`200 OK`)** :
+    ```json
+    {
+      "status": "success",
+      "message": "Connexion réussie à l'instance Odoo",
+      "uid": 2,
+      "username": "email@example.com",
+      "name": "Nom de l'utilisateur",
+      "company": "Nom de l'entreprise",
+      "instance": "https://capsy1-test-gerard.odoo.com",
+      "database": "capsy1-test-gerard"
+    }
+    ```
+
+---
+
+## 🚑 7. Aide au dépannage (Troubleshooting)
 
 Si vous recevez une erreur **500 (Internal Server Error)** :
 
@@ -73,6 +104,6 @@ Si vous recevez une erreur **500 (Internal Server Error)** :
 
 ---
 
-## 🔒 7. Sécurité
+## 🔒 8. Sécurité
 
 L'API utilise un fichier `.env` pour ne jamais exposer vos secrets dans le code source. Dans un environnement de production, il est recommandé d'ajouter une couche d'authentification (OAuth2 ou API Key) entre Capsy et cette API.
