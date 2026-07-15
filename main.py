@@ -309,14 +309,30 @@ def add_module_endpoints(app_instance, module_id, config):
                 fields_list = get_safe_fields(odoo_client, resolved_model)
                 
             ids = odoo_client.env[resolved_model].search([], limit=limit)
-            if fields_list:
-                records = odoo_client.env[resolved_model].read(ids, fields_list)
-            else:
-                records = odoo_client.env[resolved_model].read(ids)
+            
+            # Tente de lire les champs spécifiés ou les champs sûrs
+            try:
+                if fields_list:
+                    records = odoo_client.env[resolved_model].read(ids, fields_list)
+                else:
+                    records = odoo_client.env[resolved_model].read(ids)
+            except Exception as read_error:
+                # Si la lecture échoue (ex: règle d'accès sur un champ spécifique),
+                # on se replie sur des champs ultra-basiques et universels
+                try:
+                    records = odoo_client.env[resolved_model].read(ids, ['id', 'display_name'])
+                except Exception:
+                    raise read_error # Si même le fallback échoue, on propage l'erreur d'origine
                 
             return [{"id": r["id"], "data": r} for r in records]
         except Exception as e:
-            raise HTTPException(status_code=404, detail=f"Erreur de lecture {tag}: {str(e)}")
+            error_msg = str(e)
+            if "AccessError" in error_msg or "n'êtes pas autorisé" in error_msg or "Permission denied" in error_msg:
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"Accès refusé pour le module '{tag}' : L'utilisateur Odoo n'a pas les droits nécessaires (lecture) sur ce modèle ou ses enregistrements."
+                )
+            raise HTTPException(status_code=404, detail=f"Erreur de lecture {tag}: {error_msg}")
 
     @app_instance.post(f"{prefix}/", response_model=ItemResponse, tags=[tag], summary=f"Écrire (Créer) {tag}")
     async def create_item(item: ItemBase, odoo_client=Depends(get_odoo)):
@@ -325,7 +341,13 @@ def add_module_endpoints(app_instance, module_id, config):
             new_id = odoo_client.env[resolved_model].create(item.data)
             return {"id": new_id, "data": item.data}
         except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Erreur de création {tag}: {str(e)}")
+            error_msg = str(e)
+            if "AccessError" in error_msg or "n'êtes pas autorisé" in error_msg or "Permission denied" in error_msg:
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"Accès refusé pour le module '{tag}' : L'utilisateur Odoo n'a pas les droits nécessaires (écriture/création) sur ce modèle."
+                )
+            raise HTTPException(status_code=400, detail=f"Erreur de création {tag}: {error_msg}")
 
     @app_instance.put(f"{prefix}/{{item_id}}", response_model=ItemResponse, tags=[tag], summary=f"Modifier {tag}")
     async def update_item(item_id: int, item: ItemBase, odoo_client=Depends(get_odoo)):
@@ -334,7 +356,13 @@ def add_module_endpoints(app_instance, module_id, config):
             odoo_client.env[resolved_model].write([item_id], item.data)
             return {"id": item_id, "data": item.data}
         except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Erreur de modification {tag}: {str(e)}")
+            error_msg = str(e)
+            if "AccessError" in error_msg or "n'êtes pas autorisé" in error_msg or "Permission denied" in error_msg:
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"Accès refusé pour le module '{tag}' : L'utilisateur Odoo n'a pas les droits nécessaires (modification) sur ce modèle ou cet enregistrement."
+                )
+            raise HTTPException(status_code=400, detail=f"Erreur de modification {tag}: {error_msg}")
 
 # Application de la génération pour chaque module
 for mod_id, mod_cfg in MODULES_CONFIG.items():
