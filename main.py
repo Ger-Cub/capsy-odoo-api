@@ -277,6 +277,20 @@ def resolve_model_name(odoo_client, model_name):
                 continue
     return model_name
 
+# Cache pour stocker les champs sûrs par modèle
+FIELDS_CACHE = {}
+
+def get_safe_fields(odoo_client, model_name):
+    if model_name not in FIELDS_CACHE:
+        try:
+            fields_info = odoo_client.env[model_name].fields_get(attributes=['type'])
+            # On ignore les champs one2many / many2many pour éviter les erreurs de droits d'accès
+            safe_types = {'boolean', 'integer', 'float', 'char', 'text', 'html', 'date', 'datetime', 'selection', 'many2one'}
+            FIELDS_CACHE[model_name] = [field for field, info in fields_info.items() if info.get('type') in safe_types]
+        except Exception:
+            return []
+    return FIELDS_CACHE[model_name]
+
 # --- Générateur de Routes ---
 def add_module_endpoints(app_instance, module_id, config):
     model_name = config["model"]
@@ -284,11 +298,22 @@ def add_module_endpoints(app_instance, module_id, config):
     prefix = f"/{module_id}"
 
     @app_instance.get(f"{prefix}/", response_model=List[ItemResponse], tags=[tag], summary=f"Lire {tag}")
-    async def read_items(limit: int = 10, odoo_client=Depends(get_odoo)):
+    async def read_items(limit: int = 10, fields: Optional[str] = None, odoo_client=Depends(get_odoo)):
         try:
             resolved_model = resolve_model_name(odoo_client, model_name)
+            
+            # Détermination des champs à lire
+            if fields:
+                fields_list = [f.strip() for f in fields.split(",") if f.strip()]
+            else:
+                fields_list = get_safe_fields(odoo_client, resolved_model)
+                
             ids = odoo_client.env[resolved_model].search([], limit=limit)
-            records = odoo_client.env[resolved_model].read(ids)
+            if fields_list:
+                records = odoo_client.env[resolved_model].read(ids, fields_list)
+            else:
+                records = odoo_client.env[resolved_model].read(ids)
+                
             return [{"id": r["id"], "data": r} for r in records]
         except Exception as e:
             raise HTTPException(status_code=404, detail=f"Erreur de lecture {tag}: {str(e)}")
