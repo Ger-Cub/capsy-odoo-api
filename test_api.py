@@ -25,11 +25,33 @@ if __name__ == "__main__":
     # 1. Tester la racine
     test_endpoint("GET", "/")
 
-    # 2. Tester la lecture du module Ventes
+    # 2. Tester l'authentification /login
+    import os
+    from dotenv import load_dotenv
+    load_dotenv()
+    
+    odoo_user = os.getenv("ODOO_USERNAME")
+    odoo_password = os.getenv("ODOO_PASSWORD")
+    odoo_db = os.getenv("ODOO_DB")
+    odoo_url = os.getenv("ODOO_URL")
+    
+    if odoo_user and odoo_password:
+        print("Test de la connexion avec les identifiants du fichier .env...")
+        test_endpoint("POST", "/login", {
+            "username": odoo_user,
+            "password": odoo_password,
+            "db": odoo_db,
+            "url": odoo_url
+        })
+    else:
+        print("Identifiants .env manquants pour tester l'authentification.")
+
+    # 3. Tester la lecture du module Ventes
     test_endpoint("GET", "/sales/")
 
-    # 3. Tester la création d'un événement
+    # 4. Tester la création d'un événement
     test_endpoint("POST", "/events/", {"data": {"nom": "Conférence Capsy", "date": "2024-10-12"}})
 
-    # 4. Tester la modification des paramètres
+    # 5. Tester la modification des paramètres
     test_endpoint("PUT", "/settings/1", {"data": {"theme": "dark", "notifications": True}})
+
