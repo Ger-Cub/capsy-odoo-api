@@ -10,13 +10,24 @@ from dotenv import load_dotenv
 # Chargement des identifiants
 load_dotenv()
 
+# Lecture dynamique des variables d'environnement
+_ODOO_URL      = os.getenv("ODOO_URL", "https://odoo.example.com")
+_ODOO_DB       = os.getenv("ODOO_DB", "")
+_ODOO_USERNAME = os.getenv("ODOO_USERNAME", "utilisateur@example.com")
+_ODOO_HOST     = _ODOO_URL.replace("https://", "").replace("http://", "").split('/')[0]
+
 app = FastAPI(
     title="🚀 Capsy-Odoo API Bridge",
-    description="""
+    description=f"""
 ## 🌉 Connecteur Universel Odoo - Capsy
 
-Cette API permet d'interagir de manière fluide avec l'instance Odoo **essaiek3.odoo.com**. 
+Cette API permet d'interagir de manière fluide avec l'instance Odoo **{_ODOO_HOST}**.
 Elle est conçue pour être utilisée par des services tiers, des applications mobiles ou des agents IA.
+
+### 🔐 Connexion active :
+*   **Instance** : `{_ODOO_URL}`
+*   **Base de données** : `{_ODOO_DB}`
+*   **Utilisateur** : `{_ODOO_USERNAME}`
 
 ### 🛠 Fonctionnalités clés :
 *   **🔌 Connexion Directe** : Accès sécurisé aux modèles Odoo via OdooRPC.
@@ -33,12 +44,17 @@ L'API est configurée pour interagir avec les modules suivants de votre instance
 *   **Ressources Humaines** : Employés, Paie, Congés
 *   **Système** : Apps, Paramètres
 
-***Note :*** *Les erreurs 500 indiquent généralement un manque de permissions sur l'utilisateur Odoo ou un module non installé sur l'instance.*
+***Note :*** *Les erreurs 500 indiquent généralement un manque de permissions sur l'utilisateur `{_ODOO_USERNAME}` ou un module non installé sur l'instance `{_ODOO_HOST}`.*
+
+---
+### 📚 Documentation & Téléchargement :
+Vous pouvez consulter ou télécharger la documentation complète de l'API ici :
+*   **Documentation technique** : [Télécharger la documentation (API_DOCUMENTATION.md)](https://capsy-odoo-api.vercel.app/docs/API_DOCUMENTATION.md)
 """,
     version="3.1.0",
     contact={
         "name": "Support Capsy Services",
-        "url": "https://capsy.services",
+        "url": "https://capsy-services.vercel.app",
     }
 )
 
@@ -59,21 +75,54 @@ class ItemResponse(BaseModel):
     id: int
     data: Dict[str, Any]
 
+class OdooLoginRequest(BaseModel):
+    username: str
+    password: str
+    db: Optional[str] = None
+    url: Optional[str] = None
+
 # --- Gestion de la connexion Odoo ---
 def get_odoo():
     try:
-        url = os.getenv("ODOO_URL", "https://essaiek3.odoo.com")
-        host = url.replace("https://", "").replace("http://", "").split('/')[0]
-        
-        odoo = odoorpc.ODOO(host, protocol="jsonrpc+ssl", port=443)
+        odoo = odoorpc.ODOO(_ODOO_HOST, protocol="jsonrpc+ssl", port=443)
         odoo.login(
-            os.getenv("ODOO_DB"), 
-            os.getenv("ODOO_USERNAME"), 
+            _ODOO_DB,
+            _ODOO_USERNAME,
             os.getenv("ODOO_PASSWORD")
         )
         return odoo
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erreur Odoo : {str(e)}")
+
+# --- Endpoint de Connexion ---
+@app.post("/login", tags=["🔐 Connexion"], summary="Connexion d'un utilisateur Odoo")
+async def login_odoo(credentials: OdooLoginRequest):
+    try:
+        url_to_use = credentials.url or _ODOO_URL
+        db_to_use = credentials.db or _ODOO_DB
+        host = url_to_use.replace("https://", "").replace("http://", "").split('/')[0]
+        
+        odoo = odoorpc.ODOO(host, protocol="jsonrpc+ssl", port=443)
+        odoo.login(db_to_use, credentials.username, credentials.password)
+        
+        # Récupération des informations de l'utilisateur connecté
+        user_info = odoo.env['res.users'].browse(odoo.env.uid)
+        
+        return {
+            "status": "success",
+            "message": "Connexion réussie à l'instance Odoo",
+            "uid": odoo.env.uid,
+            "username": credentials.username,
+            "name": user_info.name,
+            "company": user_info.company_id.name if hasattr(user_info, 'company_id') else None,
+            "instance": url_to_use,
+            "database": db_to_use
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=401,
+            detail=f"Échec de l'authentification Odoo : {str(e)}"
+        )
 
 # --- Configuration des Modules ---
 MODULES_CONFIG = {

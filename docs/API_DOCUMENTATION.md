@@ -8,7 +8,23 @@ Son rôle principal est de simplifier, sécuriser et automatiser les échanges d
 
 ---
 
-## 🎯 2. À quoi ça sert ? (Cas d'usage)
+## 🔐 2. Configuration de connexion
+
+Les paramètres de connexion sont chargés **dynamiquement** depuis le fichier `.env` au démarrage du serveur. La documentation interactive (Swagger `/docs`) affiche automatiquement les valeurs actives.
+
+| Variable | Description | Exemple |
+| :--- | :--- | :--- |
+| `ODOO_URL` | URL complète de l'instance Odoo | `https://capsy1-test-gerard.odoo.com` |
+| `ODOO_DB` | Nom de la base de données Odoo | `capsy1-test-gerard` |
+| `ODOO_USERNAME` | Email de l'utilisateur Odoo | `gerardcubakabisimwa@gmail.com` |
+| `ODOO_PASSWORD` | Mot de passe ou clé API Odoo | `****` |
+
+> ⚠️ **Ne jamais commiter le fichier `.env`**. Il est exclu du dépôt via `.gitignore`.  
+> Créez un fichier `.env.example` avec des valeurs fictives pour documenter la structure.
+
+---
+
+## 🎯 3. À quoi ça sert ? (Cas d'usage)
 
 ### 🔓 Libérer la donnée Odoo
 
@@ -25,7 +41,7 @@ Cette API est le "système nerveux" qui permet à **Capsy AI** d'interagir avec 
 
 ---
 
-## 🛠️ 3. Fonctionnement Technique
+## 🛠️ 4. Fonctionnement Technique
 
 L'API repose sur trois piliers :
 
@@ -35,7 +51,7 @@ L'API repose sur trois piliers :
 
 ---
 
-## 📂 4. Structure des Méthodes
+## 📂 5. Structure des Méthodes
 
 Pour chaque application (24 modules disponibles), l'API implémente trois types d'actions :
 
@@ -47,16 +63,16 @@ Pour chaque application (24 modules disponibles), l'API implémente trois types 
 
 ---
 
-## 🚑 5. Aide au dépannage (Troubleshooting)
+## 🚑 6. Aide au dépannage (Troubleshooting)
 
 Si vous recevez une erreur **500 (Internal Server Error)** :
 
-* **Authentification** : Vérifiez vos identifiants dans le fichier `.env`. Assurez-vous que le mot de passe ou la clé API est correct.
-* **Droits d'accès** : L'utilisateur Odoo (`bahavukevin@gmail.com`) doit avoir les droits de lecture/écriture sur les modules concernés (Contacts, CRM, etc.).
-* **Modules installés** : L'API essaie d'accéder à des modèles (ex: `hr.employee`). Si le module "Employés" n'est pas installé sur votre instance Odoo `essaiek3`, Odoo renverra une erreur.
+* **Authentification** : Vérifiez vos identifiants dans le fichier `.env`. L'instance active et l'utilisateur sont affichés dans la description de `/docs`.
+* **Droits d'accès** : L'utilisateur Odoo défini dans `ODOO_USERNAME` doit avoir les droits de lecture/écriture sur les modules concernés (Contacts, CRM, etc.).
+* **Modules installés** : L'API essaie d'accéder à des modèles (ex: `hr.employee`). Si le module "Employés" n'est pas installé sur l'instance définie dans `ODOO_URL`, Odoo renverra une erreur.
 
 ---
 
-## 🔒 6. Sécurité
+## 🔒 7. Sécurité
 
 L'API utilise un fichier `.env` pour ne jamais exposer vos secrets dans le code source. Dans un environnement de production, il est recommandé d'ajouter une couche d'authentification (OAuth2 ou API Key) entre Capsy et cette API.
