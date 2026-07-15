@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="fr">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Capsy-Odoo Dashboard | Premium Interface</title>
+    <link rel="stylesheet" href="style.css">
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+</head>
+
+<body>
+    <div id="app">
+        <!-- Vue Connexion -->
+        <div id="login-view" class="view">
+            <div class="login-card glass">
+                <div class="logo">
+                    <span class="capsy-text">CAPSY</span><span class="odoo-text">-ODOO</span>
+                </div>
+                <h2>Connectez votre instance</h2>
+                <p class="subtitle">Entrez vos identifiants Odoo pour synchroniser vos données.</p>
+
+                <form id="login-form">
+                    <div class="input-group">
+                        <label>URL Odoo</label>
+                        <input type="text" id="odoo_url" placeholder="https://votre-instance.odoo.com" required>
+                        <div class="help-text"><i class="fas fa-info-circle"></i> Exemple: https://essaiek3.odoo.com
+                        </div>
+                    </div>
+                    <div class="input-group">
+                        <label>Base de données</label>
+                        <input type="text" id="odoo_db" placeholder="nom_de_votre_base" required>
+                    </div>
+                    <div class="input-group">
+                        <label>Utilisateur / Email</label>
+                        <input type="email" id="odoo_username" placeholder="exemple@test.com" required>
+                    </div>
+                    <div class="input-group">
+                        <label>Mot de passe / Clé API</label>
+                        <input type="password" id="odoo_password" placeholder="••••••••••••" required>
+                    </div>
+                    <button type="submit" class="btn-primary">Synchroniser <i class="fas fa-rocket"></i></button>
+                </form>
+            </div>
+        </div>
+
+        <!-- Vue Tableau de Bord (Main) -->
+        <div id="dashboard-view" class="view hidden">
+            <header class="glass">
+                <div class="header-left">
+                    <button id="back-to-apps" class="hidden"><i class="fas fa-th"></i></button>
+                    <h1>Dashboard</h1>
+                </div>
+                <div class="header-right">
+                    <div class="user-profile">
+                        <div class="avatar">GS</div>
+                        <span id="display-user">Utilisateur</span>
+                        <button id="logout-btn"><i class="fas fa-sign-out-alt"></i></button>
+                    </div>
+                </div>
+            </header>
+
+            <main>
+                <!-- Grille d'applications -->
+                <div id="apps-grid" class="grid">
+                    <!-- Généré dynamiquement -->
+                </div>
+
+                <!-- Vue Liste Module -->
+                <div id="module-detail" class="hidden">
+                    <div class="module-header">
+                        <h2 id="current-module-title">Titre Module</h2>
+                        <button class="btn-add" id="add-item-btn"><i class="fas fa-plus"></i> Nouveau</button>
+                    </div>
+                    <div class="table-container glass">
+                        <table id="data-table">
+                            <thead>
+                                <tr id="table-head"></tr>
+                            </thead>
+                            <tbody id="table-body"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </main>
+        </div>
+    </div>
+
+    <!-- Modal pour ajout/édition -->
+    <div id="modal" class="modal hidden">
+        <div class="modal-content glass">
+            <h3 id="modal-title">Nouvel élément</h3>
+            <div id="modal-form-fields"></div>
+            <div class="modal-actions">
+                <button class="btn-cancel" onclick="closeModal()">Annuler</button>
+                <button class="btn-primary" id="save-btn">Enregistrer</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="script.js"></script>
+</body>
+
+</html>
