@@ -1,10 +1,12 @@
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 import odoorpc
 import os
+import json
 from dotenv import load_dotenv
 
 # Chargement des identifiants
@@ -49,7 +51,8 @@ L'API est configurée pour interagir avec les modules suivants de votre instance
 ---
 ### 📚 Documentation & Téléchargement :
 Vous pouvez consulter ou télécharger la documentation complète de l'API ici :
-*   **Documentation technique** : [Télécharger la documentation (API_DOCUMENTATION.md)](https://capsy-odoo-api.vercel.app/docs/API_DOCUMENTATION.md)
+*   **Version Web HTML** : [Consulter la documentation en ligne](/documentation)
+*   **Documentation technique** : [Télécharger le fichier (API_DOCUMENTATION.md)](https://capsy-odoo-api.vercel.app/docs/API_DOCUMENTATION.md)
 """,
     version="3.1.0",
     contact={
@@ -123,6 +126,113 @@ async def login_odoo(credentials: OdooLoginRequest):
             status_code=401,
             detail=f"Échec de l'authentification Odoo : {str(e)}"
         )
+
+# --- Endpoint de la Documentation HTML ---
+@app.get("/documentation", response_class=HTMLResponse, tags=["📖 Documentation"], summary="Afficher la documentation complète en HTML")
+async def get_documentation():
+    try:
+        doc_path = os.path.join(os.path.dirname(__file__), "docs", "API_DOCUMENTATION.md")
+        with open(doc_path, "r", encoding="utf-8") as f:
+            markdown_content = f.read()
+    except Exception:
+        markdown_content = "# Documentation indisponible pour le moment."
+
+    # Code HTML avec un style premium vert (CAPSY Services)
+    html_content = f"""
+    <!DOCTYPE html>
+    <html lang="fr">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Documentation API Capsy-Odoo</title>
+        <!-- Tailwind CSS -->
+        <script src="https://cdn.tailwindcss.com"></script>
+        <!-- Google Fonts Outfit -->
+        <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800&display=swap" rel="stylesheet">
+        <!-- Marked.js -->
+        <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+        <!-- FontAwesome -->
+        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+        <!-- Github Markdown CSS -->
+        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/github-markdown-css/5.2.0/github-markdown.min.css">
+        <style>
+            body {{
+                font-family: 'Outfit', sans-serif;
+                background-color: #f8fafc;
+            }}
+            .markdown-body {{
+                background-color: transparent !important;
+                font-family: 'Outfit', sans-serif !important;
+            }}
+            .markdown-body h1, .markdown-body h2, .markdown-body h3 {{
+                border-bottom: 1px solid #e2e8f0 !important;
+                font-family: 'Outfit', sans-serif !important;
+                font-weight: 800 !important;
+                color: #003600 !important;
+                padding-bottom: 8px !important;
+            }}
+            .markdown-body pre {{
+                background-color: #0f172a !important;
+                border-radius: 12px !important;
+                border: 1px solid #1e293b !important;
+                padding: 16px !important;
+            }}
+            .markdown-body code {{
+                font-family: monospace !important;
+                color: #0f172a;
+            }}
+            .markdown-body pre code {{
+                color: #f8fafc !important;
+            }}
+            .glass {{
+                background: rgba(255, 255, 255, 0.85);
+                backdrop-filter: blur(12px);
+                -webkit-backdrop-filter: blur(12px);
+                border: 1px solid rgba(255, 255, 255, 0.4);
+            }}
+        </style>
+    </head>
+    <body class="min-h-screen text-slate-800">
+        <!-- Navigation -->
+        <nav class="sticky top-0 z-50 glass border-b border-slate-200/50 px-6 py-4 flex items-center justify-between">
+            <div class="flex items-center gap-3">
+                <div class="h-10 w-10 rounded-xl bg-gradient-to-tr from-[#003600] to-[#00a847] flex items-center justify-center text-white shadow-md">
+                    <i class="fa-solid fa-network-wired fa-lg"></i>
+                </div>
+                <div>
+                    <span class="font-extrabold text-[#003600] tracking-tight text-lg">CAPSY</span><span class="font-bold text-slate-500 text-lg">-ODOO</span>
+                    <p class="text-[10px] text-slate-400 font-semibold tracking-wider uppercase">Bridge API</p>
+                </div>
+            </div>
+            <div class="flex items-center gap-3">
+                <a href="/docs" class="flex items-center gap-2 px-4 py-2 bg-gradient-to-r from-[#008738] to-[#00a847] text-white rounded-xl text-sm font-bold shadow-md hover:shadow-lg transition-all hover:-translate-y-0.5">
+                    <i class="fa-solid fa-code"></i>
+                    <span>Interactive Swagger Docs</span>
+                </a>
+            </div>
+        </nav>
+
+        <!-- Contenu principal -->
+        <div class="max-w-5xl mx-auto px-4 py-10 sm:px-6 lg:px-8">
+            <div class="bg-white rounded-3xl shadow-xl border border-slate-100 p-6 sm:p-12">
+                <div id="content" class="markdown-body">
+                    <div class="flex justify-center items-center py-20">
+                        <i class="fa-solid fa-circle-notch fa-spin fa-2xl text-[#008738]"></i>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <script>
+            document.addEventListener('DOMContentLoaded', () => {{
+                const rawMarkdown = {json.dumps(markdown_content)};
+                document.getElementById('content').innerHTML = marked.parse(rawMarkdown);
+            }});
+        </script>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html_content)
 
 # --- Configuration des Modules ---
 MODULES_CONFIG = {
