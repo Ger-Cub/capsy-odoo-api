@@ -262,6 +262,21 @@ MODULES_CONFIG = {
     "settings": {"model": "res.config.settings", "label": "Paramètres"},
 }
 
+# --- Résolution Dynamique des Modèles (Odoo v16 vs v17+) ---
+def resolve_model_name(odoo_client, model_name):
+    fallbacks = {
+        "mail.channel": ["discuss.channel", "mail.channel"],
+    }
+    if model_name in fallbacks:
+        for fb in fallbacks[model_name]:
+            try:
+                # Tente d'accéder au modèle pour voir s'il existe dans le registre d'Odoo
+                if odoo_client.env[fb]:
+                    return fb
+            except Exception:
+                continue
+    return model_name
+
 # --- Générateur de Routes ---
 def add_module_endpoints(app_instance, module_id, config):
     model_name = config["model"]
@@ -271,8 +286,9 @@ def add_module_endpoints(app_instance, module_id, config):
     @app_instance.get(f"{prefix}/", response_model=List[ItemResponse], tags=[tag], summary=f"Lire {tag}")
     async def read_items(limit: int = 10, odoo_client=Depends(get_odoo)):
         try:
-            ids = odoo_client.env[model_name].search([], limit=limit)
-            records = odoo_client.env[model_name].read(ids)
+            resolved_model = resolve_model_name(odoo_client, model_name)
+            ids = odoo_client.env[resolved_model].search([], limit=limit)
+            records = odoo_client.env[resolved_model].read(ids)
             return [{"id": r["id"], "data": r} for r in records]
         except Exception as e:
             raise HTTPException(status_code=404, detail=f"Erreur de lecture {tag}: {str(e)}")
@@ -280,7 +296,8 @@ def add_module_endpoints(app_instance, module_id, config):
     @app_instance.post(f"{prefix}/", response_model=ItemResponse, tags=[tag], summary=f"Écrire (Créer) {tag}")
     async def create_item(item: ItemBase, odoo_client=Depends(get_odoo)):
         try:
-            new_id = odoo_client.env[model_name].create(item.data)
+            resolved_model = resolve_model_name(odoo_client, model_name)
+            new_id = odoo_client.env[resolved_model].create(item.data)
             return {"id": new_id, "data": item.data}
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Erreur de création {tag}: {str(e)}")
@@ -288,7 +305,8 @@ def add_module_endpoints(app_instance, module_id, config):
     @app_instance.put(f"{prefix}/{{item_id}}", response_model=ItemResponse, tags=[tag], summary=f"Modifier {tag}")
     async def update_item(item_id: int, item: ItemBase, odoo_client=Depends(get_odoo)):
         try:
-            odoo_client.env[model_name].write([item_id], item.data)
+            resolved_model = resolve_model_name(odoo_client, model_name)
+            odoo_client.env[resolved_model].write([item_id], item.data)
             return {"id": item_id, "data": item.data}
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Erreur de modification {tag}: {str(e)}")
