@@ -1,4 +1,6 @@
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Response
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
+
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse
@@ -7,7 +9,9 @@ from typing import List, Optional, Dict, Any
 import odoorpc
 import os
 import json
+import httpx
 from dotenv import load_dotenv
+
 
 # Chargement des identifiants
 load_dotenv()
@@ -18,43 +22,47 @@ _ODOO_DB       = os.getenv("ODOO_DB", "")
 _ODOO_USERNAME = os.getenv("ODOO_USERNAME", "utilisateur@example.com")
 _ODOO_HOST     = _ODOO_URL.replace("https://", "").replace("http://", "").split('/')[0]
 
+security = HTTPBasic(auto_error=False)
+
 app = FastAPI(
-    title="🚀 Capsy-Odoo API Bridge",
+    title="🚀 Capsy-Odoo & KoboToolbox API Bridge",
     description=f"""
-## 🌉 Connecteur Universel Odoo - Capsy
+## 🌉 Connecteur Universel Capsy - Odoo & KoboToolbox
 
-Cette API permet d'interagir de manière fluide avec l'instance Odoo **{_ODOO_HOST}**.
-Elle est conçue pour être utilisée par des services tiers, des applications mobiles ou des agents IA.
+Cette API est une passerelle complète permettant d'interagir de manière fluide avec l'ERP **Odoo ({_ODOO_HOST})** ainsi qu'avec les bases de données de collecte de données **KoboToolbox**.
+Elle est conçue pour être consommée par des services tiers, des applications mobiles ou des agents IA (Capsy AI).
 
-### 🔐 Connexion active :
-*   **Instance** : `{_ODOO_URL}`
-*   **Base de données** : `{_ODOO_DB}`
-*   **Utilisateur** : `{_ODOO_USERNAME}`
+### 🔐 Connexion & Authentification :
+* **Instance Odoo** : `{_ODOO_URL}`
+* **Base de données** : `{_ODOO_DB}`
+* **Authentification Swagger (Cadenas 🔒)** : Vous pouvez cliquer sur le bouton **Authorize 🔒** en haut à droite sur Swagger pour utiliser vos propres identifiants Odoo (email & mot de passe). Si le cadenas n'est pas renseigné, les identifiants du fichier `.env` (`{_ODOO_USERNAME}`) seront utilisés par défaut.
+* **KoboToolbox** : Chargé dynamiquement depuis la variable d'environnement `ID_DB_KOBOTOOLBOX` ou passé en paramètre `asset_id`.
+
 
 ### 🛠 Fonctionnalités clés :
-*   **🔌 Connexion Directe** : Accès sécurisé aux modèles Odoo via OdooRPC.
-*   **📖 Opérations CRUD** : Lecture, Création et Modification sur plus de 20 modules.
-*   **🏗 Structure Normalisée** : Réponses JSON uniformes pour tous les modules.
+* **🔌 Connexion Directe Odoo & KoboToolbox** : Accès sécurisé aux modèles Odoo via OdooRPC et à KoboToolbox via son API REST v2.
+* **📖 Opérations CRUD Complètes** : Lecture, Création, Modification et Suppression (`GET`, `POST`, `PUT`).
+* **🏗 Structure Normalisée** : Réponses JSON uniformes pour tous les modules.
 
-### 📂 Applications supportées (24 modules) :
-L'API est configurée pour interagir avec les modules suivants de votre instance Odoo :
-*   **Communication** : Discussion, Calendrier, Rendez-vous
-*   **Productivité** : To-do, Connaissances, Documents, Feuilles de temps, Planning
-*   **Commerce** : Contacts, CRM, Ventes, Événements
-*   **Gestion** : Comptabilité, Tableaux de bord, Inventaire, Signature
-*   **Marketing** : Site Web, Marketing Automation, Email Marketing
-*   **Ressources Humaines** : Employés, Paie, Congés
-*   **Système** : Apps, Paramètres
+### 📂 Applications & Modules supportés (28 modules Odoo + KoboToolbox) :
+* **Communication & Collaboration** : Discussion, Live Chat, Calendrier, Rendez-vous
+* **Gestion de Projets & Formation** : Projets, To-do, eLearning, Sondages, Connaissances, Documents, Feuilles de temps, Planning
+* **Commerce & Relation Client** : Contacts, CRM, Ventes, Événements
+* **Gestion Financière & Opérationnelle** : Comptabilité, Tableaux de bord, Inventaire, Signature
+* **Marketing** : Site Web, Marketing Automation, Email Marketing
+* **Ressources Humaines** : Employés, Paie, Congés
+* **Collecte de Données Terrain** : 📊 **KoboToolbox** (Soumissions, Asset, CRUD complet)
+* **Système** : Apps, Paramètres
 
-***Note :*** *Les erreurs 500 indiquent généralement un manque de permissions sur l'utilisateur `{_ODOO_USERNAME}` ou un module non installé sur l'instance `{_ODOO_HOST}`.*
+***Note :*** *En cas d'erreur 401 ou 403, vérifiez vos identifiants dans le cadenas 🔒 de Swagger ou vos droits d'accès Odoo/KoboToolbox.*
 
 ---
 ### 📚 Documentation & Téléchargement :
 Vous pouvez consulter ou télécharger la documentation complète de l'API ici :
-*   **Version Web HTML** : [Consulter la documentation en ligne](/documentation)
-*   **Documentation technique** : [Télécharger le fichier (API_DOCUMENTATION.md)](https://capsy-odoo-api.vercel.app/docs/API_DOCUMENTATION.md)
+* **Version Web HTML** : [Consulter la documentation en ligne](/documentation)
+* **Documentation technique** : [Télécharger le fichier (API_DOCUMENTATION.md)](https://capsy-odoo-api.vercel.app/docs/API_DOCUMENTATION.md)
 """,
-    version="3.1.0",
+    version="3.3.0",
     contact={
         "name": "Support Capsy Services",
         "url": "https://capsy-services.vercel.app",
@@ -85,17 +93,31 @@ class OdooLoginRequest(BaseModel):
     url: Optional[str] = None
 
 # --- Gestion de la connexion Odoo ---
-def get_odoo():
+def get_odoo(auth: Optional[HTTPBasicCredentials] = Depends(security)):
+    username = auth.username if (auth and auth.username) else os.getenv("ODOO_USERNAME")
+    password = auth.password if (auth and auth.password) else os.getenv("ODOO_PASSWORD")
+
+    if not username or not password:
+        raise HTTPException(
+            status_code=401,
+            detail="Identifiants Odoo requis. Veuillez saisir votre adresse email et mot de passe via le cadenas 🔒 (Authorize) sur Swagger ou configurer le fichier .env.",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+
     try:
         odoo = odoorpc.ODOO(_ODOO_HOST, protocol="jsonrpc+ssl", port=443)
         odoo.login(
             _ODOO_DB,
-            _ODOO_USERNAME,
-            os.getenv("ODOO_PASSWORD")
+            username,
+            password
         )
         return odoo
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erreur Odoo : {str(e)}")
+        raise HTTPException(
+            status_code=401 if ("AccessDenied" in str(e) or "authentication" in str(e).lower()) else 500,
+            detail=f"Échec de connexion Odoo pour '{username}' : {str(e)}"
+        )
+
 
 # --- Endpoint de Connexion ---
 @app.post("/login", tags=["🔐 Connexion"], summary="Connexion d'un utilisateur Odoo")
@@ -240,6 +262,10 @@ MODULES_CONFIG = {
     "calendar": {"model": "calendar.event", "label": "Calendrier"},
     "appointments": {"model": "calendar.appointment.type", "label": "Rendez-vous"},
     "todo": {"model": "project.task", "label": "To-do"},
+    "projects": {"model": "project.project", "label": "Projets"},
+    "elearning": {"model": "slide.channel", "label": "eLearning"},
+    "surveys": {"model": "survey.survey", "label": "Sondages"},
+    "livechat": {"model": "im_livechat.channel", "label": "Live Chat"},
     "knowledge": {"model": "knowledge.article", "label": "Connaissances"},
     "contacts": {"model": "res.partner", "label": "Contacts"},
     "crm": {"model": "crm.lead", "label": "CRM"},
@@ -266,6 +292,7 @@ MODULES_CONFIG = {
 def resolve_model_name(odoo_client, model_name):
     fallbacks = {
         "mail.channel": ["discuss.channel", "mail.channel"],
+        "im_livechat.channel": ["im_livechat.channel", "discuss.channel"],
     }
     if model_name in fallbacks:
         for fb in fallbacks[model_name]:
@@ -364,18 +391,146 @@ def add_module_endpoints(app_instance, module_id, config):
                 )
             raise HTTPException(status_code=400, detail=f"Erreur de modification {tag}: {error_msg}")
 
+
 # Application de la génération pour chaque module
 for mod_id, mod_cfg in MODULES_CONFIG.items():
     add_module_endpoints(app, mod_id, mod_cfg)
 
+# --- Endpoints KoboToolbox (CRUD) ---
+KOBO_BASE_URL = os.getenv("KOBOTOOLBOX_URL", "https://kf.kobotoolbox.org").rstrip("/")
+KOBO_TOKEN = os.getenv("KOBOTOOLBOX_TOKEN", "")
+
+def get_kobo_headers():
+    headers = {"User-Agent": "Capsy-Odoo-API-Bridge/1.0"}
+    token = os.getenv("KOBOTOOLBOX_TOKEN", KOBO_TOKEN)
+    if token:
+        headers["Authorization"] = f"Token {token}"
+    return headers
+
+def resolve_kobo_asset_id(asset_id: Optional[str] = None) -> str:
+    target = asset_id or os.getenv("ID_DB_KOBOTOOLBOX")
+    if not target:
+        raise HTTPException(
+            status_code=400,
+            detail="Asset ID KoboToolbox non spécifié. Veuillez le fournir via le paramètre 'asset_id' ou le définir dans le fichier .env (ID_DB_KOBOTOOLBOX)."
+        )
+    return target
+
+class KoboItemBase(BaseModel):
+    data: Dict[str, Any]
+
+@app.get("/kobotoolbox/", tags=["📊 KoboToolbox"], summary="Lire les données KoboToolbox (Liste)")
+async def get_kobo_data(
+    asset_id: Optional[str] = None,
+    limit: int = 100,
+    start: int = 0
+):
+    target_asset = resolve_kobo_asset_id(asset_id)
+    url = f"{KOBO_BASE_URL}/api/v2/assets/{target_asset}/data.json"
+    params = {}
+    if limit:
+        params["limit"] = limit
+    if start:
+        params["start"] = start
+
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(url, headers=get_kobo_headers(), params=params, timeout=15.0)
+            if response.status_code != 200:
+                raise HTTPException(
+                    status_code=response.status_code,
+                    detail=f"Erreur KoboToolbox ({response.status_code}): {response.text}"
+                )
+            return response.json()
+        except httpx.RequestError as exc:
+            raise HTTPException(status_code=502, detail=f"Erreur de connexion à KoboToolbox: {str(exc)}")
+
+@app.get("/kobotoolbox/asset", tags=["📊 KoboToolbox"], summary="Obtenir les informations de l'asset KoboToolbox")
+async def get_kobo_asset_info(asset_id: Optional[str] = None):
+    target_asset = resolve_kobo_asset_id(asset_id)
+    url = f"{KOBO_BASE_URL}/api/v2/assets/{target_asset}.json"
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(url, headers=get_kobo_headers(), timeout=15.0)
+            if response.status_code != 200:
+                raise HTTPException(
+                    status_code=response.status_code,
+                    detail=f"Erreur KoboToolbox ({response.status_code}): {response.text}"
+                )
+            return response.json()
+        except httpx.RequestError as exc:
+            raise HTTPException(status_code=502, detail=f"Erreur de connexion à KoboToolbox: {str(exc)}")
+
+@app.get("/kobotoolbox/{submission_id}", tags=["📊 KoboToolbox"], summary="Lire une soumission KoboToolbox par ID")
+async def get_kobo_submission(submission_id: int, asset_id: Optional[str] = None):
+    target_asset = resolve_kobo_asset_id(asset_id)
+    url = f"{KOBO_BASE_URL}/api/v2/assets/{target_asset}/data/{submission_id}.json"
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(url, headers=get_kobo_headers(), timeout=15.0)
+            if response.status_code == 404:
+                raise HTTPException(status_code=404, detail=f"Soumission #{submission_id} introuvable dans KoboToolbox.")
+            if response.status_code != 200:
+                raise HTTPException(
+                    status_code=response.status_code,
+                    detail=f"Erreur KoboToolbox ({response.status_code}): {response.text}"
+                )
+            return response.json()
+        except httpx.RequestError as exc:
+            raise HTTPException(status_code=502, detail=f"Erreur de connexion à KoboToolbox: {str(exc)}")
+
+@app.post("/kobotoolbox/", tags=["📊 KoboToolbox"], summary="Créer / Ajouter une soumission dans KoboToolbox")
+async def create_kobo_submission(item: KoboItemBase, asset_id: Optional[str] = None):
+    target_asset = resolve_kobo_asset_id(asset_id)
+    url = f"{KOBO_BASE_URL}/api/v2/assets/{target_asset}/data/"
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(url, json=item.data, headers=get_kobo_headers(), timeout=15.0)
+            if response.status_code not in (200, 201):
+                raise HTTPException(
+                    status_code=response.status_code,
+                    detail=f"Erreur lors de la création dans KoboToolbox ({response.status_code}): {response.text}"
+                )
+            return response.json()
+        except httpx.RequestError as exc:
+            raise HTTPException(status_code=502, detail=f"Erreur de connexion à KoboToolbox: {str(exc)}")
+
+@app.put("/kobotoolbox/{submission_id}", tags=["📊 KoboToolbox"], summary="Modifier une soumission KoboToolbox")
+async def update_kobo_submission(submission_id: int, item: KoboItemBase, asset_id: Optional[str] = None):
+    target_asset = resolve_kobo_asset_id(asset_id)
+    url = f"{KOBO_BASE_URL}/api/v2/assets/{target_asset}/data/{submission_id}/"
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.patch(url, json=item.data, headers=get_kobo_headers(), timeout=15.0)
+            if response.status_code not in (200, 201, 202):
+                response = await client.put(url, json=item.data, headers=get_kobo_headers(), timeout=15.0)
+            if response.status_code not in (200, 201, 202):
+                raise HTTPException(
+                    status_code=response.status_code,
+                    detail=f"Erreur lors de la modification KoboToolbox ({response.status_code}): {response.text}"
+                )
+            return response.json()
+        except httpx.RequestError as exc:
+            raise HTTPException(status_code=502, detail=f"Erreur de connexion à KoboToolbox: {str(exc)}")
+
+@app.get("/favicon.ico", include_in_schema=False)
+
+async def favicon():
+    return Response(status_code=204)
+
 @app.get("/", tags=["🏠 Accueil"])
 async def root():
+    kobo_asset_configured = bool(os.getenv("ID_DB_KOBOTOOLBOX"))
     return {
         "message": "Bienvenue sur l'API Capsy-Odoo LIVE",
         "documentation": "/docs",
-        "modules_actifs": len(MODULES_CONFIG)
+        "modules_actifs": len(MODULES_CONFIG),
+        "kobotoolbox_actif": kobo_asset_configured
     }
+
+
 
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+

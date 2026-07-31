@@ -14,6 +14,7 @@ def test_endpoint(method, path, data=None):
             response = requests.post(url, json=data)
         elif method == "PUT":
             response = requests.put(url, json=data)
+
             
         print(f"Status Code: {response.status_code}")
         print(f"Response: {json.dumps(response.json(), indent=2, ensure_ascii=False)}")
@@ -46,12 +47,20 @@ if __name__ == "__main__":
     else:
         print("Identifiants .env manquants pour tester l'authentification.")
 
-    # 3. Tester la lecture du module Ventes
-    test_endpoint("GET", "/sales/")
+    # 3. Tester les nouveaux modules Odoo (Projets, eLearning, Sondages, Live Chat)
+    test_endpoint("GET", "/projects/")
+    test_endpoint("GET", "/elearning/")
+    test_endpoint("GET", "/surveys/")
+    test_endpoint("GET", "/livechat/")
 
-    # 4. Tester la création d'un événement
+    # 4. Tester les endpoints KoboToolbox
+    test_endpoint("GET", "/kobotoolbox/?limit=2")
+    test_endpoint("GET", "/kobotoolbox/asset")
+
+    # 5. Tester la création d'un événement
     test_endpoint("POST", "/events/", {"data": {"nom": "Conférence Capsy", "date": "2024-10-12"}})
 
-    # 5. Tester la modification des paramètres
+    # 6. Tester la modification des paramètres
     test_endpoint("PUT", "/settings/1", {"data": {"theme": "dark", "notifications": True}})
+
 
