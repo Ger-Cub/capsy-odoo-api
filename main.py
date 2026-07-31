@@ -93,10 +93,10 @@ class OdooLoginRequest(BaseModel):
     url: Optional[str] = None
 
 # ---------------------------------------------------------------------------
-# OdooSession — couche JSON-RPC native (remplace OdooRPC)
+# OdooSession — couche JSON-RPC native async (remplace OdooRPC)
 # ---------------------------------------------------------------------------
 class OdooSession:
-    """Client JSON-RPC léger pour Odoo basé sur httpx.
+    """Client JSON-RPC léger pour Odoo basé sur httpx AsyncClient.
     Utilise /web/session/authenticate pour obtenir un session_id,
     puis /web/dataset/call_kw pour toutes les opérations métier.
     """
@@ -114,7 +114,7 @@ class OdooSession:
             "Cookie": f"session_id={self.session_id}",
         }
 
-    def call_kw(self, model: str, method: str, args: list, kwargs: dict) -> Any:
+    async def call_kw(self, model: str, method: str, args: list, kwargs: dict) -> Any:
         self._rpc_id += 1
         payload = {
             "jsonrpc": "2.0",
@@ -128,38 +128,38 @@ class OdooSession:
             },
         }
         url = f"{self.base_url}/web/dataset/call_kw"
-        with httpx.Client(timeout=20.0) as client:
-            r = client.post(url, json=payload, headers=self._headers())
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            r = await client.post(url, json=payload, headers=self._headers())
         data = r.json()
         if "error" in data:
             msg = data["error"].get("data", {}).get("message") or data["error"].get("message", "Erreur Odoo")
             raise Exception(msg)
         return data.get("result")
 
-    # helpers CRUD
-    def search(self, model: str, domain: list, limit: int = 10) -> list:
-        return self.call_kw(model, "search", [domain], {"limit": limit})
+    # helpers CRUD (tous async)
+    async def search(self, model: str, domain: list, limit: int = 10) -> list:
+        return await self.call_kw(model, "search", [domain], {"limit": limit})
 
-    def read(self, model: str, ids: list, fields: Optional[list] = None) -> list:
+    async def read(self, model: str, ids: list, fields: Optional[list] = None) -> list:
         kwargs: Dict[str, Any] = {}
         if fields:
             kwargs["fields"] = fields
-        return self.call_kw(model, "read", [ids], kwargs)
+        return await self.call_kw(model, "read", [ids], kwargs)
 
-    def search_read(self, model: str, domain: list, fields: Optional[list], limit: int = 10) -> list:
+    async def search_read(self, model: str, domain: list, fields: Optional[list], limit: int = 10) -> list:
         kwargs: Dict[str, Any] = {"limit": limit}
         if fields:
             kwargs["fields"] = fields
-        return self.call_kw(model, "search_read", [domain], kwargs)
+        return await self.call_kw(model, "search_read", [domain], kwargs)
 
-    def fields_get(self, model: str) -> dict:
-        return self.call_kw(model, "fields_get", [], {"attributes": ["type"]})
+    async def fields_get(self, model: str) -> dict:
+        return await self.call_kw(model, "fields_get", [], {"attributes": ["type"]})
 
-    def create(self, model: str, vals: dict) -> int:
-        return self.call_kw(model, "create", [vals], {})
+    async def create(self, model: str, vals: dict) -> int:
+        return await self.call_kw(model, "create", [vals], {})
 
-    def write(self, model: str, ids: list, vals: dict) -> bool:
-        return self.call_kw(model, "write", [ids, vals], {})
+    async def write(self, model: str, ids: list, vals: dict) -> bool:
+        return await self.call_kw(model, "write", [ids, vals], {})
 
 
 async def _authenticate(username: str, password: str, url: str, db: str) -> OdooSession:
@@ -184,7 +184,7 @@ async def _authenticate(username: str, password: str, url: str, db: str) -> Odoo
     session_id = result.get("session_id") or r.cookies.get("session_id")
 
     if not uid or not session_id:
-        raise HTTPException(status_code=401, detail="Authentification échouée : identifiants invalides.")
+        raise HTTPException(status_code=401, detail="Authentification échouée : identifiants invalides ou base de données incorrecte.")
 
     return OdooSession(
         base_url=url, db=db, uid=uid,
@@ -212,12 +212,13 @@ async def login_odoo(credentials: OdooLoginRequest):
     url_to_use = credentials.url or _ODOO_URL
     db_to_use  = credentials.db  or _ODOO_DB
     session = await _authenticate(credentials.username, credentials.password, url_to_use, db_to_use)
-    # Lire le nom complet et la société via call_kw
+    # Lire le nom complet et la société via call_kw (async)
     try:
-        user_data = session.read("res.users", [session.uid], ["name", "company_id"])
+        user_data = await session.read("res.users", [session.uid], ["name", "company_id"])
         name    = user_data[0].get("name") if user_data else credentials.username
         company = (user_data[0].get("company_id") or [None, ""])[1] if user_data else ""
     except Exception:
+
         name, company = credentials.username, ""
 
     return {
