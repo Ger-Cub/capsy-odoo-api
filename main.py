@@ -233,6 +233,164 @@ async def login_odoo(credentials: OdooLoginRequest):
         "session_id": session.session_id,
     }
 
+
+# --- Modèle Signup ---
+class OdooSignupRequest(BaseModel):
+    name: str
+    login: str       # email
+    password: str
+    db: Optional[str] = None
+    url: Optional[str] = None
+
+
+# --- Modèle Mot de passe oublié ---
+class OdooResetPasswordRequest(BaseModel):
+    login: str       # email
+    db: Optional[str] = None
+    url: Optional[str] = None
+
+
+# --- Endpoint Inscription (Signup) ---
+@app.post(
+    "/signup",
+    tags=["🔐 Connexion"],
+    summary="Créer un nouveau compte utilisateur Odoo",
+    description="""
+Crée un nouveau compte utilisateur sur l'instance Odoo via le mécanisme `web/signup`.
+
+**Paramètres requis :**
+- `name` : Nom complet de l'utilisateur
+- `login` : Adresse email (identifiant de connexion)
+- `password` : Mot de passe (minimum 8 caractères recommandé)
+
+**Note :** L'inscription doit être activée sur l'instance Odoo cible (*Configuration → Général → Permettre l'inscription*).
+"""
+)
+async def signup_odoo(request: OdooSignupRequest):
+    url_to_use = request.url or _ODOO_URL
+    db_to_use  = request.db  or _ODOO_DB
+    signup_url = f"{url_to_use.rstrip('/')}/web/signup"
+
+    payload = {
+        "jsonrpc": "2.0",
+        "method":  "call",
+        "id":      1,
+        "params": {
+            "db":       db_to_use,
+            "login":    request.login,
+            "password": request.password,
+            "name":     request.name,
+        },
+    }
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            r = await client.post(
+                signup_url,
+                json=payload,
+                headers={"Content-Type": "application/json"},
+            )
+        data = r.json()
+
+        # Odoo renvoie une erreur JSON-RPC en cas d'échec
+        if "error" in data:
+            err_data = data["error"].get("data", {})
+            msg = err_data.get("message") or data["error"].get("message", "Erreur lors de l'inscription.")
+            raise HTTPException(status_code=400, detail=msg)
+
+        result = data.get("result", {})
+
+        # Après inscription réussie, on authentifie pour retourner le session_id
+        try:
+            session = await _authenticate(request.login, request.password, url_to_use, db_to_use)
+            user_data = await session.read("res.users", [session.uid], ["name", "company_id"])
+            name    = user_data[0].get("name") if user_data else request.name
+            company = (user_data[0].get("company_id") or [None, ""])[1] if user_data else ""
+        except Exception:
+            name, company, session = request.name, "", None
+
+        return {
+            "status":     "success",
+            "message":    "Compte créé avec succès.",
+            "uid":        session.uid if session else None,
+            "username":   request.login,
+            "name":       name,
+            "company":    company,
+            "instance":   url_to_use,
+            "database":   db_to_use,
+            "session_id": session.session_id if session else None,
+        }
+
+    except HTTPException:
+        raise
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=502, detail=f"Erreur de connexion à Odoo : {str(exc)}")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Erreur inattendue lors de l'inscription : {str(exc)}")
+
+
+# --- Endpoint Mot de passe oublié (Reset Password) ---
+@app.post(
+    "/forgot-password",
+    tags=["🔐 Connexion"],
+    summary="Demander la réinitialisation du mot de passe",
+    description="""
+Envoie un email de réinitialisation de mot de passe à l'adresse indiquée via Odoo.
+
+**Paramètre requis :**
+- `login` : Adresse email du compte Odoo
+
+**Comportement :**  
+Pour des raisons de sécurité, la réponse est identique que l'email existe ou non (prévention de l'énumération de comptes).
+L'email de réinitialisation est envoyé directement par Odoo et contient un lien sécurisé valable 24h.
+"""
+)
+async def forgot_password_odoo(request: OdooResetPasswordRequest):
+    url_to_use = request.url or _ODOO_URL
+    db_to_use  = request.db  or _ODOO_DB
+    reset_url  = f"{url_to_use.rstrip('/')}/web/reset_password"
+
+    payload = {
+        "jsonrpc": "2.0",
+        "method":  "call",
+        "id":      2,
+        "params": {
+            "db":    db_to_use,
+            "login": request.login,
+        },
+    }
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            r = await client.post(
+                reset_url,
+                json=payload,
+                headers={"Content-Type": "application/json"},
+            )
+        data = r.json()
+
+        # On ne lève pas d'erreur si l'email n'existe pas (sécurité anti-énumération)
+        if "error" in data:
+            err_data = data["error"].get("data", {})
+            msg = err_data.get("message") or data["error"].get("message", "")
+            # Si c'est une vraie erreur technique on la remonte, sinon réponse générique
+            if "SMTP" in msg or "mail" in msg.lower() or "smtp" in msg.lower():
+                raise HTTPException(
+                    status_code=502,
+                    detail="Erreur d'envoi d'email. Veuillez contacter l'administrateur."
+                )
+
+        return {
+            "status":  "success",
+            "message": "Si un compte existe pour cet email, un lien de réinitialisation a été envoyé.",
+            "login":   request.login,
+        }
+
+    except HTTPException:
+        raise
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=502, detail=f"Erreur de connexion à Odoo : {str(exc)}")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Erreur inattendue : {str(exc)}")
+
 # --- Endpoint de la Documentation HTML ---
 @app.get("/documentation", response_class=HTMLResponse, tags=["📖 Documentation"], summary="Afficher la documentation complète en HTML")
 async def get_documentation():
