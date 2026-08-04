@@ -6,7 +6,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
-import odoorpc
+# odoorpc remplacé par JSON-RPC httpx natif (branche feature/web-session-auth)
 import os
 import json
 import httpx
@@ -62,7 +62,7 @@ Vous pouvez consulter ou télécharger la documentation complète de l'API ici :
 * **Version Web HTML** : [Consulter la documentation en ligne](/documentation)
 * **Documentation technique** : [Télécharger le fichier (API_DOCUMENTATION.md)](https://capsy-odoo-api.vercel.app/docs/API_DOCUMENTATION.md)
 """,
-    version="3.3.0",
+    version="4.0.0-session",
     contact={
         "name": "Support Capsy Services",
         "url": "https://capsy-services.vercel.app",
@@ -92,62 +92,146 @@ class OdooLoginRequest(BaseModel):
     db: Optional[str] = None
     url: Optional[str] = None
 
-# --- Gestion de la connexion Odoo ---
-def get_odoo(auth: Optional[HTTPBasicCredentials] = Depends(security)):
+# ---------------------------------------------------------------------------
+# OdooSession — couche JSON-RPC native async (remplace OdooRPC)
+# ---------------------------------------------------------------------------
+class OdooSession:
+    """Client JSON-RPC léger pour Odoo basé sur httpx AsyncClient.
+    Utilise /web/session/authenticate pour obtenir un session_id,
+    puis /web/dataset/call_kw pour toutes les opérations métier.
+    """
+    def __init__(self, base_url: str, db: str, uid: int, session_id: str, username: str):
+        self.base_url   = base_url.rstrip("/")
+        self.db         = db
+        self.uid        = uid
+        self.session_id = session_id
+        self.username   = username
+        self._rpc_id    = 10
+
+    def _headers(self) -> dict:
+        return {
+            "Content-Type": "application/json",
+            "Cookie": f"session_id={self.session_id}",
+        }
+
+    async def call_kw(self, model: str, method: str, args: list, kwargs: dict) -> Any:
+        self._rpc_id += 1
+        payload = {
+            "jsonrpc": "2.0",
+            "method": "call",
+            "id": self._rpc_id,
+            "params": {
+                "model": model,
+                "method": method,
+                "args": args,
+                "kwargs": kwargs,
+            },
+        }
+        url = f"{self.base_url}/web/dataset/call_kw"
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            r = await client.post(url, json=payload, headers=self._headers())
+        data = r.json()
+        if "error" in data:
+            msg = data["error"].get("data", {}).get("message") or data["error"].get("message", "Erreur Odoo")
+            raise Exception(msg)
+        return data.get("result")
+
+    # helpers CRUD (tous async)
+    async def search(self, model: str, domain: list, limit: int = 10) -> list:
+        return await self.call_kw(model, "search", [domain], {"limit": limit})
+
+    async def read(self, model: str, ids: list, fields: Optional[list] = None) -> list:
+        kwargs: Dict[str, Any] = {}
+        if fields:
+            kwargs["fields"] = fields
+        return await self.call_kw(model, "read", [ids], kwargs)
+
+    async def search_read(self, model: str, domain: list, fields: Optional[list], limit: int = 10) -> list:
+        kwargs: Dict[str, Any] = {"limit": limit}
+        if fields:
+            kwargs["fields"] = fields
+        return await self.call_kw(model, "search_read", [domain], kwargs)
+
+    async def fields_get(self, model: str) -> dict:
+        return await self.call_kw(model, "fields_get", [], {"attributes": ["type"]})
+
+    async def create(self, model: str, vals: dict) -> int:
+        return await self.call_kw(model, "create", [vals], {})
+
+    async def write(self, model: str, ids: list, vals: dict) -> bool:
+        return await self.call_kw(model, "write", [ids, vals], {})
+
+
+async def _authenticate(username: str, password: str, url: str, db: str) -> OdooSession:
+    """Authentifie via /web/session/authenticate et retourne une OdooSession."""
+    auth_url = f"{url.rstrip('/')}/web/session/authenticate"
+    payload = {
+        "jsonrpc": "2.0",
+        "method": "call",
+        "id": 1,
+        "params": {"db": db, "login": username, "password": password},
+    }
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        r = await client.post(auth_url, json=payload, headers={"Content-Type": "application/json"})
+
+    data = r.json()
+    if "error" in data:
+        msg = data["error"].get("data", {}).get("message") or data["error"].get("message", "Erreur")
+        raise HTTPException(status_code=401, detail=f"Odoo Access Denied pour '{username}': {msg}")
+
+    result = data.get("result", {})
+    uid = result.get("uid")
+    session_id = result.get("session_id") or r.cookies.get("session_id")
+
+    if not uid or not session_id:
+        raise HTTPException(status_code=401, detail="Authentification échouée : identifiants invalides ou base de données incorrecte.")
+
+    return OdooSession(
+        base_url=url, db=db, uid=uid,
+        session_id=session_id, username=username
+    )
+
+
+async def get_odoo(auth: Optional[HTTPBasicCredentials] = Depends(security)) -> OdooSession:
+    """Dependency FastAPI — retourne une OdooSession authentifiée."""
     username = auth.username if (auth and auth.username) else os.getenv("ODOO_USERNAME")
     password = auth.password if (auth and auth.password) else os.getenv("ODOO_PASSWORD")
 
     if not username or not password:
         raise HTTPException(
             status_code=401,
-            detail="Identifiants Odoo requis. Veuillez saisir votre adresse email et mot de passe via le cadenas 🔒 (Authorize) sur Swagger ou configurer le fichier .env.",
+            detail="Identifiants Odoo requis. Cliquez sur le cadenas 🔒 (Authorize) dans Swagger pour saisir votre email et mot de passe.",
             headers={"WWW-Authenticate": "Basic"},
         )
-
-    try:
-        odoo = odoorpc.ODOO(_ODOO_HOST, protocol="jsonrpc+ssl", port=443)
-        odoo.login(
-            _ODOO_DB,
-            username,
-            password
-        )
-        return odoo
-    except Exception as e:
-        raise HTTPException(
-            status_code=401 if ("AccessDenied" in str(e) or "authentication" in str(e).lower()) else 500,
-            detail=f"Échec de connexion Odoo pour '{username}' : {str(e)}"
-        )
+    return await _authenticate(username, password, _ODOO_URL, _ODOO_DB)
 
 
 # --- Endpoint de Connexion ---
-@app.post("/login", tags=["🔐 Connexion"], summary="Connexion d'un utilisateur Odoo")
+@app.post("/login", tags=["🔐 Connexion"], summary="Connexion d'un utilisateur Odoo (retourne session_id)")
 async def login_odoo(credentials: OdooLoginRequest):
+    url_to_use = credentials.url or _ODOO_URL
+    db_to_use  = credentials.db  or _ODOO_DB
+    session = await _authenticate(credentials.username, credentials.password, url_to_use, db_to_use)
+    # Lire le nom complet et la société via call_kw (async)
     try:
-        url_to_use = credentials.url or _ODOO_URL
-        db_to_use = credentials.db or _ODOO_DB
-        host = url_to_use.replace("https://", "").replace("http://", "").split('/')[0]
-        
-        odoo = odoorpc.ODOO(host, protocol="jsonrpc+ssl", port=443)
-        odoo.login(db_to_use, credentials.username, credentials.password)
-        
-        # Récupération des informations de l'utilisateur connecté
-        user_info = odoo.env['res.users'].browse(odoo.env.uid)
-        
-        return {
-            "status": "success",
-            "message": "Connexion réussie à l'instance Odoo",
-            "uid": odoo.env.uid,
-            "username": credentials.username,
-            "name": user_info.name,
-            "company": user_info.company_id.name if hasattr(user_info, 'company_id') else None,
-            "instance": url_to_use,
-            "database": db_to_use
-        }
-    except Exception as e:
-        raise HTTPException(
-            status_code=401,
-            detail=f"Échec de l'authentification Odoo : {str(e)}"
-        )
+        user_data = await session.read("res.users", [session.uid], ["name", "company_id"])
+        name    = user_data[0].get("name") if user_data else credentials.username
+        company = (user_data[0].get("company_id") or [None, ""])[1] if user_data else ""
+    except Exception:
+
+        name, company = credentials.username, ""
+
+    return {
+        "status":     "success",
+        "message":    "Connexion réussie à l'instance Odoo",
+        "uid":        session.uid,
+        "username":   credentials.username,
+        "name":       name,
+        "company":    company,
+        "instance":   url_to_use,
+        "database":   db_to_use,
+        "session_id": session.session_id,
+    }
 
 # --- Endpoint de la Documentation HTML ---
 @app.get("/documentation", response_class=HTMLResponse, tags=["📖 Documentation"], summary="Afficher la documentation complète en HTML")
@@ -297,21 +381,20 @@ def resolve_model_name(odoo_client, model_name):
     if model_name in fallbacks:
         for fb in fallbacks[model_name]:
             try:
-                # Tente d'accéder au modèle pour voir s'il existe dans le registre d'Odoo
-                if odoo_client.env[fb]:
+                # Vérification via fields_get (JSON-RPC safe)
+                if session.fields_get(fb):
                     return fb
             except Exception:
                 continue
     return model_name
 
 # Cache pour stocker les champs sûrs par modèle
-FIELDS_CACHE = {}
+FIELDS_CACHE: Dict[str, list] = {}
 
-def get_safe_fields(odoo_client, model_name):
+def get_safe_fields(session: OdooSession, model_name: str) -> list:
     if model_name not in FIELDS_CACHE:
         try:
-            fields_info = odoo_client.env[model_name].fields_get(attributes=['type'])
-            # On ignore les champs one2many / many2many pour éviter les erreurs de droits d'accès
+            fields_info = session.fields_get(model_name)
             safe_types = {'boolean', 'integer', 'float', 'char', 'text', 'html', 'date', 'datetime', 'selection', 'many2one'}
             FIELDS_CACHE[model_name] = [field for field, info in fields_info.items() if info.get('type') in safe_types]
         except Exception:
@@ -325,76 +408,51 @@ def add_module_endpoints(app_instance, module_id, config):
     prefix = f"/{module_id}"
 
     @app_instance.get(f"{prefix}/", response_model=List[ItemResponse], tags=[tag], summary=f"Lire {tag}")
-    async def read_items(limit: int = 10, fields: Optional[str] = None, odoo_client=Depends(get_odoo)):
+    async def read_items(limit: int = 10, fields: Optional[str] = None, session: OdooSession = Depends(get_odoo)):
         try:
-            resolved_model = resolve_model_name(odoo_client, model_name)
-            
-            # Détermination des champs à lire
-            if fields:
-                fields_list = [f.strip() for f in fields.split(",") if f.strip()]
-            else:
-                fields_list = get_safe_fields(odoo_client, resolved_model)
-                
-            ids = odoo_client.env[resolved_model].search([], limit=limit)
-            
-            # Tente de lire les champs spécifiés ou les champs sûrs
+            resolved_model = resolve_model_name(session, model_name)
+            fields_list = [f.strip() for f in fields.split(",") if f.strip()] if fields else get_safe_fields(session, resolved_model)
             try:
-                if fields_list:
-                    records = odoo_client.env[resolved_model].read(ids, fields_list)
-                else:
-                    records = odoo_client.env[resolved_model].read(ids)
-            except Exception as read_error:
-                # Si la lecture échoue (ex: règle d'accès sur un champ spécifique),
-                # on se replie sur des champs ultra-basiques et universels
-                try:
-                    records = odoo_client.env[resolved_model].read(ids, ['id', 'display_name'])
-                except Exception:
-                    raise read_error # Si même le fallback échoue, on propage l'erreur d'origine
-                
+                records = session.search_read(resolved_model, [], fields_list or None, limit=limit)
+            except Exception:
+                records = session.search_read(resolved_model, [], ["id", "display_name"], limit=limit)
             return [{"id": r["id"], "data": r} for r in records]
         except Exception as e:
             error_msg = str(e)
-            if "AccessError" in error_msg or "n'êtes pas autorisé" in error_msg or "Permission denied" in error_msg:
-                raise HTTPException(
-                    status_code=403,
-                    detail=f"Accès refusé pour le module '{tag}' : L'utilisateur Odoo n'a pas les droits nécessaires (lecture) sur ce modèle ou ses enregistrements."
-                )
+            if "AccessError" in error_msg or "Access Denied" in error_msg or "n'êtes pas autorisé" in error_msg:
+                raise HTTPException(status_code=403, detail=f"Accès refusé pour '{tag}' : droits insuffisants sur ce modèle.")
             raise HTTPException(status_code=404, detail=f"Erreur de lecture {tag}: {error_msg}")
 
     @app_instance.post(f"{prefix}/", response_model=ItemResponse, tags=[tag], summary=f"Écrire (Créer) {tag}")
-    async def create_item(item: ItemBase, odoo_client=Depends(get_odoo)):
+    async def create_item(item: ItemBase, session: OdooSession = Depends(get_odoo)):
         try:
-            resolved_model = resolve_model_name(odoo_client, model_name)
-            new_id = odoo_client.env[resolved_model].create(item.data)
+            resolved_model = resolve_model_name(session, model_name)
+            new_id = session.create(resolved_model, item.data)
             return {"id": new_id, "data": item.data}
         except Exception as e:
             error_msg = str(e)
-            if "AccessError" in error_msg or "n'êtes pas autorisé" in error_msg or "Permission denied" in error_msg:
-                raise HTTPException(
-                    status_code=403,
-                    detail=f"Accès refusé pour le module '{tag}' : L'utilisateur Odoo n'a pas les droits nécessaires (écriture/création) sur ce modèle."
-                )
+            if "AccessError" in error_msg or "Access Denied" in error_msg:
+                raise HTTPException(status_code=403, detail=f"Accès refusé pour '{tag}' : droits insuffisants (création).")
             raise HTTPException(status_code=400, detail=f"Erreur de création {tag}: {error_msg}")
 
     @app_instance.put(f"{prefix}/{{item_id}}", response_model=ItemResponse, tags=[tag], summary=f"Modifier {tag}")
-    async def update_item(item_id: int, item: ItemBase, odoo_client=Depends(get_odoo)):
+    async def update_item(item_id: int, item: ItemBase, session: OdooSession = Depends(get_odoo)):
         try:
-            resolved_model = resolve_model_name(odoo_client, model_name)
-            odoo_client.env[resolved_model].write([item_id], item.data)
+            resolved_model = resolve_model_name(session, model_name)
+            session.write(resolved_model, [item_id], item.data)
             return {"id": item_id, "data": item.data}
         except Exception as e:
             error_msg = str(e)
-            if "AccessError" in error_msg or "n'êtes pas autorisé" in error_msg or "Permission denied" in error_msg:
-                raise HTTPException(
-                    status_code=403,
-                    detail=f"Accès refusé pour le module '{tag}' : L'utilisateur Odoo n'a pas les droits nécessaires (modification) sur ce modèle ou cet enregistrement."
-                )
+            if "AccessError" in error_msg or "Access Denied" in error_msg:
+                raise HTTPException(status_code=403, detail=f"Accès refusé pour '{tag}' : droits insuffisants (modification).")
             raise HTTPException(status_code=400, detail=f"Erreur de modification {tag}: {error_msg}")
 
 
 # Application de la génération pour chaque module
 for mod_id, mod_cfg in MODULES_CONFIG.items():
     add_module_endpoints(app, mod_id, mod_cfg)
+
+
 
 # --- Endpoints KoboToolbox (CRUD) ---
 KOBO_BASE_URL = os.getenv("KOBOTOOLBOX_URL", "https://kf.kobotoolbox.org").rstrip("/")
