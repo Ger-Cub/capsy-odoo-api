@@ -15,6 +15,7 @@ source venv/bin/activate
 # 2. Démarrer le serveur API
 python main.py
 ```
+
 *(Le serveur sera disponible sur **`http://localhost:8000`**)*
 
 ---
@@ -24,11 +25,13 @@ python main.py
 Vous n'avez besoin d'exécuter `pip install -r requirements.txt` que **la première fois** ou si de nouvelles dépendances sont ajoutées.
 
 ### 1. Accéder au projet
+
 ```bash
 cd capsy-odoo-api
 ```
 
 ### 2. Créer et activer l'environnement virtuel
+
 ```bash
 # Sur Linux / macOS :
 python3 -m venv venv
@@ -40,11 +43,13 @@ python -m venv venv
 ```
 
 ### 3. Installer les dépendances (*Une seule fois*)
+
 ```bash
 pip install -r requirements.txt
 ```
 
 ### 4. Configurer le fichier d'environnement (`.env`)
+
 ```env
 ODOO_URL=https://testjack.odoo.com
 ODOO_DB=testjack
@@ -54,21 +59,30 @@ ID_DB_KOBOTOOLBOX=votre_id_kobotoolbox
 ```
 
 ### 5. Démarrer le serveur API
+
 ```bash
 python main.py
 # ou avec hot-reload :
-uvicorn main:app --reload --host 0.0.0.0 --port 8000
+uvicorn main:app --reload --host 0.0.0.0 --port 8001
 ```
 
 ### 6. Tester les endpoints
+
 ```bash
 python test_api.py
 ```
 
-
 ---
 
 ## 📚 Documentation & Liens
+
 * 🌐 **Swagger UI Interactif (avec Cadenas 🔒 pour identifiants)** : [http://localhost:8000/docs](http://localhost:8000/docs)
 * 📖 **Documentation Web HTML** : [http://localhost:8000/documentation](http://localhost:8000/documentation)
 * 📄 **Documentation Markdown détaillée** : [docs/API_DOCUMENTATION.md](docs/API_DOCUMENTATION.md)
+
+
+cd capsy-odoo-api
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+uvicorn main:app --reload --port 8000

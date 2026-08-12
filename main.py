@@ -72,7 +72,13 @@ Vous pouvez consulter ou télécharger la documentation complète de l'API ici :
 # Configuration CORS pour autoriser le port 3000 (React)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    # Allow common local dev origins (Vite/React). Keep credentials enabled for session cookie usage.
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -89,6 +95,18 @@ class ItemResponse(BaseModel):
 class OdooLoginRequest(BaseModel):
     username: str
     password: str
+    db: Optional[str] = None
+    url: Optional[str] = None
+
+
+class SessionCallRequest(BaseModel):
+    session_id: str
+    uid: int
+    username: str
+    model: str
+    method: str
+    args: Optional[List[Any]] = None
+    kwargs: Optional[Dict[str, Any]] = None
     db: Optional[str] = None
     url: Optional[str] = None
 
@@ -130,7 +148,22 @@ class OdooSession:
         url = f"{self.base_url}/web/dataset/call_kw"
         async with httpx.AsyncClient(timeout=20.0) as client:
             r = await client.post(url, json=payload, headers=self._headers())
-        data = r.json()
+
+        # If the endpoint returned a non-200, surface the status and body for debugging
+        if r.status_code != 200:
+            text = None
+            try:
+                text = r.text
+            except Exception:
+                text = '<no response body>'
+            raise Exception(f"HTTP {r.status_code}: {text}")
+
+        # Parse JSON safely
+        try:
+            data = r.json()
+        except Exception as exc:
+            raise Exception(f"Invalid JSON response from Odoo RPC endpoint: {str(exc)} - raw: {r.text}")
+
         if "error" in data:
             msg = data["error"].get("data", {}).get("message") or data["error"].get("message", "Erreur Odoo")
             raise Exception(msg)
@@ -241,6 +274,22 @@ class OdooSignupRequest(BaseModel):
     password: str
     db: Optional[str] = None
     url: Optional[str] = None
+
+
+class AppointmentCreate(BaseModel):
+    serviceTitle: str
+    clientName: str
+    clientEmail: Optional[str] = None
+    clientPhone: Optional[str] = None
+    clientNotes: Optional[str] = None
+    date: str
+    timeSlot: str
+    preferredTherapist: Optional[str] = None
+
+
+class CreateAppointmentRequest(BaseModel):
+    appointment: AppointmentCreate
+    loggedInPartnerId: Optional[int] = None
 
 
 # --- Modèle Mot de passe oublié ---
@@ -391,6 +440,99 @@ async def forgot_password_odoo(request: OdooResetPasswordRequest):
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Erreur inattendue : {str(exc)}")
 
+
+@app.post('/appointments/create', tags=["Rendez-vous"], summary="Créer un rendez-vous (contact + event + tâche)")
+async def create_appointment(req: CreateAppointmentRequest, session: OdooSession = Depends(get_odoo)):
+    """Crée un contact si nécessaire, un `calendar.event` et une `project.task` liée.
+    Utilise les identifiants configurés côté serveur (vars d'env) via la dépendance `get_odoo`.
+    """
+    appt = req.appointment
+    try:
+        # 1) trouver ou créer le partenaire
+        # Construire un domain Odoo correct (éviter les listes imbriquées qui provoquent Domain() invalid)
+        search_domain = []
+        if appt.clientEmail:
+            search_domain = [['email', '=', appt.clientEmail]]
+        elif appt.clientPhone:
+            search_domain = [['phone', '=', appt.clientPhone]]
+        else:
+            search_domain = []
+
+        partner_ids = await session.search('res.partner', search_domain, limit=1)
+        partner_id = None
+        if partner_ids:
+            partner_id = partner_ids[0]
+        else:
+            partner_id = await session.create('res.partner', {
+                'name': appt.clientName,
+                'email': appt.clientEmail or False,
+                'phone': appt.clientPhone or False,
+                'comment': 'Créé via site web (réservation)'
+            })
+
+        # 2) créer l'événement calendrier
+        times = appt.timeSlot.split(' - ')
+        startTimeStr = times[0].replace('h', ':')
+        endTimeStr = times[1].replace('h', ':') if len(times) > 1 else startTimeStr
+        start = f"{appt.date} {startTimeStr}:00"
+        stop = f"{appt.date} {endTimeStr}:00"
+
+        event_vals = {
+            'name': f"RDV: {appt.serviceTitle}",
+            'start': start,
+            'stop': stop,
+            'partner_ids': [[6, 0, [partner_id]]],
+            'description': f"Client: {appt.clientName}\nEmail: {appt.clientEmail or ''}\nPhone: {appt.clientPhone or ''}\nNotes: {appt.clientNotes or ''}\nTherapist: {appt.preferredTherapist or ''}",
+        }
+        event_id = await session.create('calendar.event', event_vals)
+
+        # 3) créer une tâche projet liée (project.task)
+        task_vals = {
+            'name': f"RDV: {appt.serviceTitle} - {appt.clientName}",
+            'partner_id': partner_id,
+            'date_deadline': appt.date,
+            'description': f"RDV créé automatiquement (event #{event_id})",
+        }
+        try:
+            task_id = await session.create('project.task', task_vals)
+        except Exception:
+            # si le module project n'est pas installé, on ignore l'erreur
+            task_id = None
+
+        return {
+            'status': 'success',
+            'message': 'Rendez-vous créé',
+            'event_id': event_id,
+            'partner_id': partner_id,
+            'task_id': task_id,
+        }
+
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Erreur de création Rendez-vous: {str(exc)}")
+
+
+@app.get('/debug/odoo_ping', tags=["Debug"], summary="Ping Odoo via JSON-RPC (auth + call_kw)")
+async def debug_odoo_ping(session: OdooSession = Depends(get_odoo)):
+    """Teste l'authentification et un appel simple `fields_get`/`search_read` pour diagnostiquer 404/erreurs.
+    Retourne le résultat ou l'erreur détaillée.
+    """
+    try:
+        # essayer un fields_get sur res.partner
+        try:
+            fg = await session.fields_get('res.partner')
+        except Exception as e:
+            return {"status": "error", "stage": "fields_get", "detail": str(e)}
+
+        # essayer un search_read simple
+        try:
+            res = await session.search_read('res.partner', [], ['id', 'name'], limit=1)
+            return {"status": "ok", "fields_get_sample_keys": list(fg.keys())[:5], "sample": res}
+        except Exception as e:
+            return {"status": "error", "stage": "search_read", "detail": str(e)}
+
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Debug Odoo failed: {str(exc)}")
+
 # --- Endpoint de la Documentation HTML ---
 @app.get("/documentation", response_class=HTMLResponse, tags=["📖 Documentation"], summary="Afficher la documentation complète en HTML")
 async def get_documentation():
@@ -498,6 +640,26 @@ async def get_documentation():
     """
     return HTMLResponse(content=html_content)
 
+
+@app.post('/session/call', tags=["🔐 Session"], summary="Appel JSON-RPC via session_id (proxy)")
+async def session_call(req: SessionCallRequest):
+    """Permet à un client front (ayant un `session_id` et `uid`) d'invoquer `call_kw` via la session existante.
+    Utile pour déléguer des actions Odoo sans transmettre le mot de passe.
+    """
+    url_to_use = req.url or _ODOO_URL
+    db_to_use = req.db or _ODOO_DB
+    if not req.session_id or not req.uid:
+        raise HTTPException(status_code=400, detail="session_id et uid requis")
+
+    session = OdooSession(base_url=url_to_use, db=db_to_use, uid=req.uid, session_id=req.session_id, username=req.username)
+    try:
+        args = req.args or []
+        kwargs = req.kwargs or {}
+        result = await session.call_kw(req.model, req.method, args, kwargs)
+        return {"result": result}
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Erreur Odoo via session: {str(exc)}")
+
 # --- Configuration des Modules ---
 MODULES_CONFIG = {
     "discussion": {"model": "mail.channel", "label": "Discussion"},
@@ -512,6 +674,7 @@ MODULES_CONFIG = {
     "contacts": {"model": "res.partner", "label": "Contacts"},
     "crm": {"model": "crm.lead", "label": "CRM"},
     "sales": {"model": "sale.order", "label": "Ventes"},
+    "vent": {"model": "product.product", "label": "Ventes - Produits"},
     "dashboards": {"model": "spreadsheet.dashboard", "label": "Tableaux de bord"},
     "accounting": {"model": "account.move", "label": "Comptabilité"},
     "documents": {"model": "documents.document", "label": "Documents"},
@@ -531,7 +694,7 @@ MODULES_CONFIG = {
 }
 
 # --- Résolution Dynamique des Modèles (Odoo v16 vs v17+) ---
-def resolve_model_name(odoo_client, model_name):
+async def resolve_model_name(odoo_client, model_name):
     fallbacks = {
         "mail.channel": ["discuss.channel", "mail.channel"],
         "im_livechat.channel": ["im_livechat.channel", "discuss.channel"],
@@ -540,7 +703,8 @@ def resolve_model_name(odoo_client, model_name):
         for fb in fallbacks[model_name]:
             try:
                 # Vérification via fields_get (JSON-RPC safe)
-                if session.fields_get(fb):
+                fields = await odoo_client.fields_get(fb)
+                if fields:
                     return fb
             except Exception:
                 continue
@@ -549,10 +713,10 @@ def resolve_model_name(odoo_client, model_name):
 # Cache pour stocker les champs sûrs par modèle
 FIELDS_CACHE: Dict[str, list] = {}
 
-def get_safe_fields(session: OdooSession, model_name: str) -> list:
+async def get_safe_fields(session: OdooSession, model_name: str) -> list:
     if model_name not in FIELDS_CACHE:
         try:
-            fields_info = session.fields_get(model_name)
+            fields_info = await session.fields_get(model_name)
             safe_types = {'boolean', 'integer', 'float', 'char', 'text', 'html', 'date', 'datetime', 'selection', 'many2one'}
             FIELDS_CACHE[model_name] = [field for field, info in fields_info.items() if info.get('type') in safe_types]
         except Exception:
@@ -568,12 +732,12 @@ def add_module_endpoints(app_instance, module_id, config):
     @app_instance.get(f"{prefix}/", response_model=List[ItemResponse], tags=[tag], summary=f"Lire {tag}")
     async def read_items(limit: int = 10, fields: Optional[str] = None, session: OdooSession = Depends(get_odoo)):
         try:
-            resolved_model = resolve_model_name(session, model_name)
-            fields_list = [f.strip() for f in fields.split(",") if f.strip()] if fields else get_safe_fields(session, resolved_model)
+            resolved_model = await resolve_model_name(session, model_name)
+            fields_list = [f.strip() for f in fields.split(",") if f.strip()] if fields else await get_safe_fields(session, resolved_model)
             try:
-                records = session.search_read(resolved_model, [], fields_list or None, limit=limit)
+                records = await session.search_read(resolved_model, [], fields_list or None, limit=limit)
             except Exception:
-                records = session.search_read(resolved_model, [], ["id", "display_name"], limit=limit)
+                records = await session.search_read(resolved_model, [], ["id", "display_name"], limit=limit)
             return [{"id": r["id"], "data": r} for r in records]
         except Exception as e:
             error_msg = str(e)
@@ -584,8 +748,8 @@ def add_module_endpoints(app_instance, module_id, config):
     @app_instance.post(f"{prefix}/", response_model=ItemResponse, tags=[tag], summary=f"Écrire (Créer) {tag}")
     async def create_item(item: ItemBase, session: OdooSession = Depends(get_odoo)):
         try:
-            resolved_model = resolve_model_name(session, model_name)
-            new_id = session.create(resolved_model, item.data)
+            resolved_model = await resolve_model_name(session, model_name)
+            new_id = await session.create(resolved_model, item.data)
             return {"id": new_id, "data": item.data}
         except Exception as e:
             error_msg = str(e)
@@ -596,8 +760,8 @@ def add_module_endpoints(app_instance, module_id, config):
     @app_instance.put(f"{prefix}/{{item_id}}", response_model=ItemResponse, tags=[tag], summary=f"Modifier {tag}")
     async def update_item(item_id: int, item: ItemBase, session: OdooSession = Depends(get_odoo)):
         try:
-            resolved_model = resolve_model_name(session, model_name)
-            session.write(resolved_model, [item_id], item.data)
+            resolved_model = await resolve_model_name(session, model_name)
+            await session.write(resolved_model, [item_id], item.data)
             return {"id": item_id, "data": item.data}
         except Exception as e:
             error_msg = str(e)
