@@ -80,7 +80,6 @@ python test_api.py
 * 📖 **Documentation Web HTML** : [http://localhost:8000/documentation](http://localhost:8000/documentation)
 * 📄 **Documentation Markdown détaillée** : [docs/API_DOCUMENTATION.md](docs/API_DOCUMENTATION.md)
 
-
 cd capsy-odoo-api
 python3 -m venv .venv
 source .venv/bin/activate
