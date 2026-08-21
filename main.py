@@ -73,13 +73,14 @@ Vous pouvez consulter ou télécharger la documentation complète de l'API ici :
 # Configuration CORS pour autoriser le port 3000 (React)
 app.add_middleware(
     CORSMiddleware,
-    # Allow common local dev origins (Vite/React). Keep credentials enabled for session cookie usage.
     allow_origins=[
+        "https://capsy-services.vercel.app",
         "http://localhost:3000",
         "http://127.0.0.1:3000",
         "http://localhost:5173",
         "http://127.0.0.1:5173",
     ],
+    allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
