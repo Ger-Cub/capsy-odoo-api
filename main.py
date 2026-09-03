@@ -961,6 +961,7 @@ APPT_FIELDS = [
 ]
 
 
+@app.get('/appointments', tags=["Rendez-vous"], include_in_schema=False)
 @app.get(
     '/appointments/',
     tags=["Rendez-vous"],
