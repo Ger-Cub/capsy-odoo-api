@@ -1,0 +1,33 @@
+[
+  {
+    "x_studio_identifiant_code": "tccg-2026",
+    "x_name": "Formation des Psychologues Facilitateurs en TCCG",
+    "x_studio_titre_court": "Thérapie Cognitivo-Comportementale de Groupe",
+    "x_studio_statut": "passée",
+    "x_studio_dates_texte": "01 - 03 Juillet 2026",
+    "x_studio_duree": "24 heures",
+    "x_studio_lieu": "Goma, RDC",
+    "x_studio_prefixe_certificat": "TCCG-2026",
+    "x_studio_description": "Formation intensive organisée par le Centre d'Assistance Psychologique, CAPSY SARL, en partenariat avec HEAL AFRICA/STAR-RDC. Les participants ont développé les compétences nécessaires pour animer des groupes thérapeutiques TCC-G et conduire des interventions cliniques conformément au protocole.",
+    "x_studio_partenaires": "HEAL AFRICA, STAR-RDC, CAPSY SERVICES",
+    "x_studio_competences_visees": [
+      "Animer des groupes thérapeutiques TCC-G",
+      "Appliquer les techniques de restructuration cognitive",
+      "Conduire des séances de psychoéducation",
+      "Gérer les situations cliniques complexes",
+      "Utiliser les outils de communication thérapeutique",
+      "Documenter les interventions conformément au protocole"
+    ],
+    "x_studio_signataires": [
+      { "x_name": "JACQUE KAMBALE", "x_studio_role": "Formateur principal" },
+      { "x_name": "LISETTE PANZU", "x_studio_role": "Cofacilitateur" },
+      { "x_name": "VINCENT", "x_studio_role": "Cofacilitateur" },
+      { "x_name": "ELIE LUSENGE", "x_studio_role": "Pour CAPSY SERVICE" }
+    ],
+    "x_studio_participant_ids": [
+      { "x_studio_numero_de_certificat": "TCCG-2026-001", "x_name": "BALUGE NYAMWIRUKA Bienfaiteur", "x_studio_titre_professionnel": "psychologue clinicien (ne)" },
+      { "x_studio_numero_de_certificat": "TCCG-2026-002", "x_name": "KAVIRA MWASI Esther", "x_studio_titre_professionnel": "psychologue clinicien (ne)" },
+      { "x_studio_numero_de_certificat": "TCCG-2026-003", "x_name": "KAVUGHO KATIMIKA Gloria", "x_studio_titre_professionnel": "psychologue clinicien (ne)" }
+    ]
+  }
+]
