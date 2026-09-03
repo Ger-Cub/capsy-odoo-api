@@ -86,6 +86,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# --- Include external routers (formations) ---
+import sys
+from pathlib import Path
+ROOT = Path(__file__).parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+try:
+    from routers.formations import router as formations_router
+    app.include_router(formations_router)
+except Exception as _e:
+    print(f"[WARN] formations router not included: {_e}")
+
 # --- Modèles de données ---
 class ItemBase(BaseModel):
     data: Dict[str, Any]
@@ -325,73 +337,111 @@ class OdooResetPasswordRequest(BaseModel):
 
 
 # --- Endpoint Inscription (Signup) ---
+# --- Endpoint Inscription (Signup) ---
 @app.post(
     "/signup",
     tags=["🔐 Connexion"],
     summary="Créer un nouveau compte utilisateur Odoo",
     description="""
-Crée un nouveau compte utilisateur sur l'instance Odoo via le mécanisme `web/signup`.
-
-**Paramètres requis :**
-- `name` : Nom complet de l'utilisateur
-- `login` : Adresse email (identifiant de connexion)
-- `password` : Mot de passe (minimum 8 caractères recommandé)
-
-**Note :** L'inscription doit être activée sur l'instance Odoo cible (*Configuration → Général → Permettre l'inscription*).
+Crée un nouveau compte utilisateur portail sur l'instance Odoo.
 """
 )
 async def signup_odoo(request: OdooSignupRequest):
     url_to_use = request.url or _ODOO_URL
     db_to_use  = request.db  or _ODOO_DB
-    signup_url = f"{url_to_use.rstrip('/')}/web/signup"
 
-    payload = {
-        "jsonrpc": "2.0",
-        "method":  "call",
-        "id":      1,
-        "params": {
-            "db":       db_to_use,
-            "login":    request.login,
-            "password": request.password,
-            "name":     request.name,
-        },
-    }
+    # Authentifier une session administrateur pour les opérations de création
+    admin_user = os.getenv("ODOO_USERNAME")
+    admin_pass = os.getenv("ODOO_PASSWORD")
+
     try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            r = await client.post(
-                signup_url,
-                json=payload,
-                headers={"Content-Type": "application/json"},
-            )
-        data = r.json()
+        admin_session = await _authenticate(admin_user, admin_pass, url_to_use, db_to_use)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erreur d'authentification admin Odoo : {str(e)}")
 
-        # Odoo renvoie une erreur JSON-RPC en cas d'échec
-        if "error" in data:
-            err_data = data["error"].get("data", {})
-            msg = err_data.get("message") or data["error"].get("message", "Erreur lors de l'inscription.")
-            raise HTTPException(status_code=400, detail=msg)
+    login_clean = request.login.strip().lower()
 
-        result = data.get("result", {})
+    try:
+        # 1. Vérifier si l'utilisateur existe déjà
+        existing_users = await admin_session.search('res.users', [['login', '=ilike', login_clean]], limit=1)
+        if existing_users:
+            raise HTTPException(status_code=400, detail="Un compte avec cette adresse email existe déjà. Veuillez vous connecter.")
 
-        # Après inscription réussie, on authentifie pour retourner le session_id
+        # 2. Trouver ou créer le contact res.partner
+        existing_partners = await admin_session.search('res.partner', [['email', '=ilike', login_clean]], limit=1)
+        partner_id = None
+        if existing_partners:
+            partner_id = existing_partners[0]
+            await admin_session.write('res.partner', [partner_id], {'name': request.name})
+        else:
+            partner_id = await admin_session.create('res.partner', {
+                'name': request.name,
+                'email': login_clean,
+                'comment': 'Client créé via le formulaire d\'inscription Capsy Services',
+            })
+
+        # 3. Trouver le groupe Portail dans Odoo (support Odoo 19 & versions antérieures)
+        portal_group_id = None
         try:
-            session = await _authenticate(request.login, request.password, url_to_use, db_to_use)
-            user_data = await session.read("res.users", [session.uid], ["name", "company_id"])
-            name    = user_data[0].get("name") if user_data else request.name
-            company = (user_data[0].get("company_id") or [None, ""])[1] if user_data else ""
+            ir_data = await admin_session.search_read(
+                'ir.model.data',
+                [['module', '=', 'base'], ['name', '=', 'group_portal']],
+                ['res_id'],
+                limit=1
+            )
+            if ir_data and ir_data[0].get('res_id'):
+                portal_group_id = ir_data[0]['res_id']
         except Exception:
-            name, company, session = request.name, "", None
+            pass
+
+        if not portal_group_id:
+            try:
+                groups = await admin_session.search_read(
+                    'res.groups',
+                    [['name', 'ilike', 'Portal']],
+                    ['id'],
+                    limit=1
+                )
+                if groups:
+                    portal_group_id = groups[0]['id']
+            except Exception:
+                pass
+
+        # 4. Création du compte res.users (avec support group_ids Odoo 19+ / groups_id)
+        user_vals = {
+            'name': request.name,
+            'login': login_clean,
+            'email': login_clean,
+            'password': request.password,
+            'partner_id': partner_id,
+        }
+
+        if portal_group_id:
+            user_vals['group_ids'] = [(6, 0, [portal_group_id])]
+
+        try:
+            await admin_session.create('res.users', user_vals)
+        except Exception as create_err:
+            if 'group_ids' in str(create_err) and portal_group_id:
+                del user_vals['group_ids']
+                user_vals['groups_id'] = [(6, 0, [portal_group_id])]
+                await admin_session.create('res.users', user_vals)
+            else:
+                raise create_err
+
+        # 5. Authentifier le nouvel utilisateur pour retourner sa session
+        user_session = await _authenticate(login_clean, request.password, url_to_use, db_to_use)
 
         return {
             "status":     "success",
-            "message":    "Compte créé avec succès.",
-            "uid":        session.uid if session else None,
-            "username":   request.login,
-            "name":       name,
-            "company":    company,
+            "message":    "Compte créé avec succès. Bienvenue sur CAPSY !",
+            "uid":        user_session.uid,
+            "username":   login_clean,
+            "name":       request.name,
+            "partner_id": partner_id,
             "instance":   url_to_use,
             "database":   db_to_use,
-            "session_id": session.session_id if session else None,
+            "session_id": user_session.session_id,
         }
 
     except HTTPException:
@@ -400,6 +450,7 @@ async def signup_odoo(request: OdooSignupRequest):
         raise HTTPException(status_code=502, detail=f"Erreur de connexion à Odoo : {str(exc)}")
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Erreur inattendue lors de l'inscription : {str(exc)}")
+
 
 
 # --- Endpoint Mot de passe oublié (Reset Password) ---
@@ -486,51 +537,173 @@ CLINICAL_SUBTASKS = [
 PROJET_ACCOMPAGNEMENT = "Accompagnement individuel"
 
 
+async def get_available_therapists_helper(
+    session: OdooSession,
+    start_time: str,
+    stop_time: str,
+    service_title: Optional[str] = None
+) -> dict:
+    """
+    Vérifie la disponibilité réelle des thérapeutes dans Odoo pour un créneau [start_time, stop_time].
+    Consulte calendar.event pour détecter les conflits d'horaires.
+    """
+    therapists = []
+    try:
+        user_records = await session.search_read(
+            'res.users',
+            [['active', '=', True], ['share', '=', False]],
+            ['id', 'name', 'partner_id'],
+            limit=50
+        )
+        for u in user_records:
+            pid = u.get('partner_id')
+            partner_id = pid[0] if isinstance(pid, list) else pid
+            therapists.append({
+                'id': u['id'],
+                'name': u['name'],
+                'partner_id': partner_id
+            })
+    except Exception as e:
+        print(f"[WARN] Erreur lors de la récupération des thérapeutes : {e}")
+
+    busy_user_ids = set()
+    busy_partner_ids = set()
+
+    try:
+        overlapping_events = await session.search_read(
+            'calendar.event',
+            [['start', '<', stop_time], ['stop', '>', start_time]],
+            ['id', 'user_id', 'partner_ids']
+        )
+        for ev in overlapping_events:
+            uid_field = ev.get('user_id')
+            if uid_field:
+                uid_val = uid_field[0] if isinstance(uid_field, list) else uid_field
+                busy_user_ids.add(uid_val)
+            
+            pids_field = ev.get('partner_ids', [])
+            for pid in pids_field:
+                busy_partner_ids.add(pid)
+    except Exception as e:
+        print(f"[WARN] Erreur lors de la vérification des conflits de RDV : {e}")
+
+    available = []
+    busy = []
+
+    for t in therapists:
+        if t['id'] in busy_user_ids or t['partner_id'] in busy_partner_ids:
+            busy.append(t)
+        else:
+            available.append(t)
+
+    return {
+        'available': available,
+        'busy': busy,
+        'total': len(therapists)
+    }
+
+
+@app.get('/therapists/availability', tags=["Thérapeutes"], summary="Vérifier la disponibilité des thérapeutes pour un créneau")
+async def check_therapists_availability(
+    date: str,
+    timeSlot: str,
+    service_title: Optional[str] = None,
+    session: OdooSession = Depends(get_odoo),
+):
+    times = timeSlot.split(' - ')
+    start_str = times[0].strip().replace('h', ':') + ':00'
+    end_str   = times[1].strip().replace('h', ':') + ':00' if len(times) > 1 else start_str
+    start = f"{date} {start_str}"
+    stop  = f"{date} {end_str}"
+    
+    return await get_available_therapists_helper(session, start, stop, service_title)
+
+
 @app.post('/appointments/create', tags=["Rendez-vous"], summary="Créer un rendez-vous complet (contact + calendrier + dossier clinique)")
 async def create_appointment(req: CreateAppointmentRequest, session: OdooSession = Depends(get_odoo)):
     """
     Flux complet de création d'un rendez-vous CAPSY :
 
-    1. **Contact** – Crée ou retrouve le partenaire client dans Odoo.
-    2. **Calendrier** – Crée un `calendar.event` lié au type de rendez-vous Odoo
-       (le compteur « Rendez-vous à venir » s'incrémente automatiquement).
-    3. **Dossier clinique** – Crée une tâche principale dans le projet
-       « Accompagnement individuel » avec 10 sous-tâches cliniques standardisées.
+    1. **Contact & Utilisateur Portail** – Crée ou retrouve le partenaire client et son compte portail dans Odoo.
+    2. **Disponibilité Thérapeute** – Vérifie et assigne un praticien réellement disponible ("Premier disponible").
+    3. **Calendrier** – Crée un `calendar.event` dans les agendas du client et du thérapeute.
+    4. **Dossier clinique** – Crée une tâche principale dans le projet « Accompagnement individuel » avec sous-tâches.
     """
     appt = req.appointment
+    
+    # Utiliser la session admin pour contourner les restrictions ACL Odoo lors de la création d'événements et de tâches
+    admin_user = os.getenv("ODOO_USERNAME")
+    admin_pass = os.getenv("ODOO_PASSWORD")
+    try:
+        write_session = await _authenticate(admin_user, admin_pass, _ODOO_URL, _ODOO_DB)
+    except Exception:
+        write_session = session
+
     try:
         # ------------------------------------------------------------------ #
-        # 1) Résoudre ou créer le partenaire client
+        # 1) Résoudre ou créer le partenaire client + compte portail
         # ------------------------------------------------------------------ #
+        clean_email = appt.clientEmail.strip().lower() if appt.clientEmail else None
         search_domain: list = []
-        if appt.clientEmail:
-            search_domain = [['email', '=', appt.clientEmail]]
+        if clean_email:
+            search_domain = [['email', '=ilike', clean_email]]
         elif appt.clientPhone:
             search_domain = [['phone', '=', appt.clientPhone]]
 
-        partner_ids = await session.search('res.partner', search_domain, limit=1) if search_domain else []
+        partner_ids = await write_session.search('res.partner', search_domain, limit=1) if search_domain else []
         partner_id: Optional[int] = None
         if partner_ids:
             partner_id = partner_ids[0]
         else:
-            partner_id = await session.create('res.partner', {
+            partner_id = await write_session.create('res.partner', {
                 'name': appt.clientName,
-                'email': appt.clientEmail or False,
+                'email': clean_email or False,
                 'phone': appt.clientPhone or False,
                 'comment': 'Créé via site web Capsy (réservation en ligne)',
             })
 
+        # Si réservation publique (non connecté), créer automatiquement le compte portail pour lier les données
+        if not req.loggedInUserId and clean_email:
+            try:
+                user_ids = await write_session.search('res.users', [['login', '=ilike', clean_email]], limit=1)
+                if not user_ids:
+                    portal_gid = None
+                    try:
+                        ir_data = await write_session.search_read('ir.model.data', [['module', '=', 'base'], ['name', '=', 'group_portal']], ['res_id'], limit=1)
+                        if ir_data and ir_data[0].get('res_id'):
+                            portal_gid = ir_data[0]['res_id']
+                    except Exception:
+                        pass
+
+                    user_vals = {
+                        'name': appt.clientName,
+                        'login': clean_email,
+                        'email': clean_email,
+                        'password': f"Capsy@{partner_id}#2026",
+                        'partner_id': partner_id,
+                    }
+                    if portal_gid:
+                        user_vals['group_ids'] = [(6, 0, [portal_gid])]
+
+                    try:
+                        await write_session.create('res.users', user_vals)
+                    except Exception as create_err:
+                        if 'group_ids' in str(create_err) and portal_gid:
+                            del user_vals['group_ids']
+                            user_vals['groups_id'] = [(6, 0, [portal_gid])]
+                            await write_session.create('res.users', user_vals)
+            except Exception as u_err:
+                print(f"[WARN] Impossible de créer le compte utilisateur portail automatique: {u_err}")
+
         # ------------------------------------------------------------------ #
         # 2) Trouver le type de rendez-vous Odoo par correspondance de titre
-        #    → lier l'event à appointment_type_id incrémente automatiquement
-        #      le compteur « Rendez-vous à venir » dans le module Rendez-vous
         # ------------------------------------------------------------------ #
-        appointment_type_id: Optional[int] = appt.appointmentTypeId  # fourni explicitement ?
+        appointment_type_id: Optional[int] = appt.appointmentTypeId
         if not appointment_type_id:
             service_clean_name = appt.serviceTitle.split('/')[0].strip()
             for model_name in ['appointment.type', 'calendar.appointment.type']:
                 try:
-                    appt_type_ids = await session.search(
+                    appt_type_ids = await write_session.search(
                         model_name,
                         [['name', 'ilike', service_clean_name]],
                         limit=1,
@@ -542,24 +715,7 @@ async def create_appointment(req: CreateAppointmentRequest, session: OdooSession
                     continue
 
         # ------------------------------------------------------------------ #
-        # 3) Résoudre le user_id du thérapeute préféré (si fourni)
-        # ------------------------------------------------------------------ #
-        therapist_user_id: Optional[int] = None
-        organizer_name = appt.preferredTherapist or 'Capsy Services'
-        if appt.preferredTherapist and appt.preferredTherapist not in ('Premier disponible', ''):
-            try:
-                user_ids = await session.search(
-                    'res.users',
-                    [['name', 'ilike', appt.preferredTherapist]],
-                    limit=1,
-                )
-                if user_ids:
-                    therapist_user_id = user_ids[0]
-            except Exception:
-                pass
-
-        # ------------------------------------------------------------------ #
-        # 4) Convertir le créneau horaire « 08h30 - 09h30 » en datetime Odoo
+        # 3) Heures & Vérification de la disponibilité réelle du thérapeute
         # ------------------------------------------------------------------ #
         times = appt.timeSlot.split(' - ')
         start_str = times[0].strip().replace('h', ':') + ':00'
@@ -567,11 +723,47 @@ async def create_appointment(req: CreateAppointmentRequest, session: OdooSession
         start = f"{appt.date} {start_str}"
         stop  = f"{appt.date} {end_str}"
 
+        availability_data = await get_available_therapists_helper(write_session, start, stop, appt.serviceTitle)
+        available_therapists = availability_data.get('available', [])
+
+        therapist_user_id: Optional[int] = None
+        therapist_partner_id: Optional[int] = None
+        organizer_name = appt.preferredTherapist or 'Capsy Services'
+
+        if not appt.preferredTherapist or appt.preferredTherapist in ('Premier disponible', ''):
+            if available_therapists:
+                chosen = available_therapists[0]
+                therapist_user_id = chosen['id']
+                therapist_partner_id = chosen['partner_id']
+                organizer_name = chosen['name']
+            else:
+                all_therapists = availability_data.get('available', []) + availability_data.get('busy', [])
+                if all_therapists:
+                    chosen = all_therapists[0]
+                    therapist_user_id = chosen['id']
+                    therapist_partner_id = chosen['partner_id']
+                    organizer_name = chosen['name']
+        else:
+            try:
+                user_recs = await write_session.search_read(
+                    'res.users',
+                    [['name', 'ilike', appt.preferredTherapist]],
+                    ['id', 'name', 'partner_id'],
+                    limit=1
+                )
+                if user_recs:
+                    therapist_user_id = user_recs[0]['id']
+                    pid = user_recs[0].get('partner_id')
+                    therapist_partner_id = pid[0] if isinstance(pid, list) else pid
+                    organizer_name = user_recs[0]['name']
+            except Exception:
+                pass
+
         # ------------------------------------------------------------------ #
-        # 5) Construire la description HTML (format identique au site Odoo)
+        # 4) Description HTML du rendez-vous
         # ------------------------------------------------------------------ #
         phone_display  = appt.clientPhone or ''
-        email_display  = appt.clientEmail or ''
+        email_display  = clean_email or ''
         notes_display  = appt.clientNotes or 'Aucun détail supplémentaire'
         format_display = 'Au bureau CAPSY - Goma' if (appt.format or 'presentiel') == 'presentiel' else 'Séance en ligne'
 
@@ -590,11 +782,12 @@ async def create_appointment(req: CreateAppointmentRequest, session: OdooSession
         )
 
         # ------------------------------------------------------------------ #
-        # 6) Créer l'événement dans le calendrier du thérapeute
-        #    Le lien appointment_type_id incrémente « Rendez-vous à venir »
+        # 5) Créer l'événement dans le calendrier du thérapeute ET du client
         # ------------------------------------------------------------------ #
         attendee_partner_ids = [partner_id]
-        if req.loggedInPartnerId and req.loggedInPartnerId != partner_id:
+        if therapist_partner_id and therapist_partner_id not in attendee_partner_ids:
+            attendee_partner_ids.append(therapist_partner_id)
+        if req.loggedInPartnerId and req.loggedInPartnerId not in attendee_partner_ids:
             attendee_partner_ids.append(req.loggedInPartnerId)
 
         event_vals: dict = {
@@ -613,39 +806,27 @@ async def create_appointment(req: CreateAppointmentRequest, session: OdooSession
         if therapist_user_id:
             event_vals['user_id'] = therapist_user_id
 
-        # Liaison au type de RDV → incrémente le compteur « à venir » dans Odoo
         if appointment_type_id:
             event_vals['appointment_type_id'] = appointment_type_id
             event_vals['appointment_status'] = 'booked'
             event_vals['appointment_type_schedule_based_on'] = 'users'
 
-        event_id: int = await session.create('calendar.event', event_vals)
+        event_id: int = await write_session.create('calendar.event', event_vals)
 
         # ------------------------------------------------------------------ #
-        # 7) Créer le dossier clinique dans le projet « Accompagnement individuel »
-        #    + 10 sous-tâches standardisées
+        # 6) Créer le dossier clinique dans le projet « Accompagnement individuel »
         # ------------------------------------------------------------------ #
         task_id: Optional[int] = None
         subtask_ids: list = []
         project_id: Optional[int] = None
 
         try:
-            # Chercher le projet par nom exact puis par ilike
-            proj_ids = await session.search(
-                'project.project',
-                [['name', '=', PROJET_ACCOMPAGNEMENT]],
-                limit=1,
-            )
+            proj_ids = await write_session.search('project.project', [['name', '=', PROJET_ACCOMPAGNEMENT]], limit=1)
             if not proj_ids:
-                proj_ids = await session.search(
-                    'project.project',
-                    [['name', 'ilike', 'Accompagnement']],
-                    limit=1,
-                )
+                proj_ids = await write_session.search('project.project', [['name', 'ilike', 'Accompagnement']], limit=1)
             if proj_ids:
                 project_id = proj_ids[0]
 
-            # Description du dossier
             dossier_description = (
                 f"<p><strong>Dossier client :</strong> {appt.clientName}</p>"
                 f"<p><strong>Service :</strong> {appt.serviceTitle}</p>"
@@ -658,10 +839,6 @@ async def create_appointment(req: CreateAppointmentRequest, session: OdooSession
                 f"<p><em>Dossier créé automatiquement via le site Capsy — event Odoo #{event_id}</em></p>"
             )
 
-            # ------------------------------------------------------------------ #
-            # Generation de la nomenclature confidentielle du dossier client :
-            # Dossier : SC-IND-2026 — 0001-B.K
-            # ------------------------------------------------------------------ #
             prefix = "SC-IND"
             title_lower = appt.serviceTitle.lower()
             if "famil" in title_lower:
@@ -674,18 +851,16 @@ async def create_appointment(req: CreateAppointmentRequest, session: OdooSession
             import datetime
             current_year = datetime.datetime.now().year
 
-            # Extraction des initiales du client (ex: "GERARD CUBAKA BISIMWA" -> "G.C.B")
             client_parts = [p.strip() for p in appt.clientName.split() if p.strip()]
             initials_list = [p[0].upper() for p in client_parts if p[0].isalpha()]
             initials_str = ".".join(initials_list) if initials_list else "C.L"
 
-            # Calcul du numero sequentiel a 4 chiffres (0001, 0002...) pour l'annee en cours
             seq_num = 1
             try:
                 search_domain = [['name', 'ilike', f"Dossier : {prefix}-{current_year}"]]
                 if project_id:
                     search_domain.append(['project_id', '=', project_id])
-                existing_tasks = await session.search('project.task', search_domain, limit=9999)
+                existing_tasks = await write_session.search('project.task', search_domain, limit=9999)
                 seq_num = len(existing_tasks) + 1
             except Exception:
                 seq_num = 1
@@ -693,7 +868,6 @@ async def create_appointment(req: CreateAppointmentRequest, session: OdooSession
             seq_str = f"{seq_num:04d}"
             confidential_task_name = f"Dossier : {prefix}-{current_year} — {seq_str}-{initials_str}"
 
-            # Valeurs de la tâche principale (dossier)
             task_vals: dict = {
                 'name': confidential_task_name,
                 'partner_id': partner_id,
@@ -706,13 +880,12 @@ async def create_appointment(req: CreateAppointmentRequest, session: OdooSession
             if therapist_user_id:
                 task_vals['user_ids'] = [[6, 0, [therapist_user_id]]]
 
-            task_id = await session.create('project.task', task_vals)
+            task_id = await write_session.create('project.task', task_vals)
 
-            # Créer les 10 sous-tâches cliniques
             for i, subtask_name in enumerate(CLINICAL_SUBTASKS, start=1):
                 subtask_vals: dict = {
                     'name': f"{i:02d}. {subtask_name}",
-                    'parent_id': task_id,  # lie la sous-tâche au dossier principal
+                    'parent_id': task_id,
                     'partner_id': partner_id,
                     'description': f"Étape {i}/10 du suivi clinique — Dossier {appt.clientName}",
                 }
@@ -721,14 +894,12 @@ async def create_appointment(req: CreateAppointmentRequest, session: OdooSession
                 if therapist_user_id:
                     subtask_vals['user_ids'] = [[6, 0, [therapist_user_id]]]
                 try:
-                    sub_id = await session.create('project.task', subtask_vals)
+                    sub_id = await write_session.create('project.task', subtask_vals)
                     subtask_ids.append(sub_id)
                 except Exception as sub_err:
-                    # Log mais ne bloque pas la création du dossier principal
                     print(f"[WARN] Sous-tâche '{subtask_name}' non créée : {sub_err}")
 
         except Exception as proj_err:
-            # Le module project peut être absent ou les droits insuffisants
             print(f"[WARN] Dossier clinique non créé : {proj_err}")
 
         return {
@@ -737,6 +908,7 @@ async def create_appointment(req: CreateAppointmentRequest, session: OdooSession
             'event_id': event_id,
             'appointment_type_id': appointment_type_id,
             'partner_id': partner_id,
+            'assigned_therapist': organizer_name,
             'project_id': project_id,
             'task_id': task_id,
             'subtask_ids': subtask_ids,
@@ -769,54 +941,81 @@ APPT_FIELDS = [
 @app.get(
     '/appointments/',
     tags=["Rendez-vous"],
-    summary="Lister TOUS les rendez-vous (calendar.event)",
+    summary="Lister les rendez-vous de l'utilisateur ou filtrés",
     description="""
-Retourne la liste complète des `calendar.event` visibles par l'utilisateur authentifié,
-identique à la vue `https://testjack.odoo.com/odoo/calendar`.
-
-**Paramètres optionnels :**
-- `limit` : nombre maximum de résultats (défaut 100)
-- `future_only` : si `true`, retourne uniquement les RDV à venir
-- `mine_only` : si `true`, filtre sur les RDV dont l'utilisateur est organisateur ou participant
+Retourne la liste des `calendar.event` filtrés pour l'utilisateur connecté (ses propres RDV si mine_only=true).
 """
 )
 async def list_appointments(
     limit: int = 100,
     future_only: bool = False,
     mine_only: bool = False,
+    partner_id: Optional[int] = None,
     session: OdooSession = Depends(get_odoo),
 ):
-    """Retourne tous les calendar.event (ou filtrés par utilisateur si mine_only=true)."""
     try:
         from datetime import datetime, timezone
 
-        # Domaine de base : tous les events actifs
+        admin_user = os.getenv("ODOO_USERNAME")
+        admin_pass = os.getenv("ODOO_PASSWORD")
+        try:
+            read_session = await _authenticate(admin_user, admin_pass, _ODOO_URL, _ODOO_DB)
+        except Exception:
+            read_session = session
+
         domain: list = []
 
-        if mine_only:
-            # Seulement les events où l'utilisateur est organisateur OU participant
-            domain = ['|',
-                ['user_id', '=', session.uid],
-                ['partner_ids', 'in', [session.uid]],
-            ]
+        # Obtenir le partner_id rattaché à session.uid
+        user_partner_id = partner_id
+        if not user_partner_id and session.uid:
+            try:
+                user_rec = await read_session.read('res.users', [session.uid], ['partner_id'])
+                if user_rec and user_rec[0].get('partner_id'):
+                    p = user_rec[0]['partner_id']
+                    user_partner_id = p[0] if isinstance(p, list) else p
+            except Exception:
+                pass
+
+        if mine_only or user_partner_id:
+            sub_domains = []
+            if session.uid:
+                sub_domains.append(['user_id', '=', session.uid])
+            if user_partner_id:
+                sub_domains.append(['partner_ids', 'in', [user_partner_id]])
+
+            if len(sub_domains) == 2:
+                domain = ['|', sub_domains[0], sub_domains[1]]
+            elif len(sub_domains) == 1:
+                domain = [sub_domains[0]]
 
         if future_only:
             now_str = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
             date_filter = ['start', '>=', now_str]
             if domain:
-                domain = ['&'] + domain + [date_filter]
+                domain = ['&', date_filter] + domain
             else:
                 domain = [date_filter]
 
-        records = await session.search_read(
+        clean_fields = [
+            'id', 'display_name', 'name', 'description',
+            'start', 'stop', 'allday', 'duration',
+            'location', 'show_as', 'privacy',
+            'user_id', 'partner_ids',
+            'videocall_location', 'videocall_source',
+            'appointment_status', 'appointment_type_id',
+            'active', 'display_time',
+        ]
+
+        records = await read_session.search_read(
             'calendar.event',
             domain,
-            APPT_FIELDS,
+            clean_fields,
             limit=limit,
         )
         return [{"id": r["id"], "data": r} for r in records]
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Erreur lecture rendez-vous: {str(exc)}")
+
 
 
 # ---------------------------------------------------------------------------
