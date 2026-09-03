@@ -545,13 +545,34 @@ async def get_available_therapists_helper(
 ) -> dict:
     """
     Vérifie la disponibilité réelle des thérapeutes dans Odoo pour un créneau [start_time, stop_time].
+    Si service_title est spécifié, restreint la recherche aux seuls thérapeutes autorisés pour ce service (staff_user_ids).
     Consulte calendar.event pour détecter les conflits d'horaires.
     """
     therapists = []
+    allowed_uids: list = []
+
+    if service_title:
+        try:
+            clean_title = service_title.split('/')[0].strip()
+            appt_types = await session.search_read(
+                'appointment.type',
+                [['name', 'ilike', clean_title]],
+                ['id', 'name', 'staff_user_ids'],
+                limit=1
+            )
+            if appt_types and appt_types[0].get('staff_user_ids'):
+                allowed_uids = appt_types[0]['staff_user_ids']
+        except Exception as e:
+            print(f"[WARN] Erreur lors de la recherche des therapeutes du service '{service_title}': {e}")
+
     try:
+        domain = [['active', '=', True], ['share', '=', False]]
+        if allowed_uids:
+            domain.append(['id', 'in', allowed_uids])
+
         user_records = await session.search_read(
             'res.users',
-            [['active', '=', True], ['share', '=', False]],
+            domain,
             ['id', 'name', 'partner_id'],
             limit=50
         )
