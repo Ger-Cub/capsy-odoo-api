@@ -619,6 +619,8 @@ async def check_therapists_availability(
     return await get_available_therapists_helper(session, start, stop, service_title)
 
 
+@app.post('/appointments', tags=["Rendez-vous"], include_in_schema=False)
+@app.post('/appointments/', tags=["Rendez-vous"], include_in_schema=False)
 @app.post('/appointments/create', tags=["Rendez-vous"], summary="Créer un rendez-vous complet (contact + calendrier + dossier clinique)")
 async def create_appointment(req: CreateAppointmentRequest, session: OdooSession = Depends(get_odoo)):
     """
