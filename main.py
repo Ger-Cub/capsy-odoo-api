@@ -11,6 +11,11 @@ import os
 import re
 import json
 import httpx
+from datetime import datetime, timezone
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None
 from dotenv import load_dotenv
 
 
@@ -768,19 +773,47 @@ async def create_appointment(req: CreateAppointmentRequest, session: OdooSession
                     organizer_name = chosen['name']
         else:
             try:
+                # 1. Recherche dans res.users par nom complet
                 user_recs = await write_session.search_read(
                     'res.users',
-                    [['name', 'ilike', appt.preferredTherapist]],
+                    [['name', 'ilike', appt.preferredTherapist.strip()]],
                     ['id', 'name', 'partner_id'],
                     limit=1
                 )
+                # 2. Si non trouvé, tester les mots-clés (prénom / nom)
+                if not user_recs:
+                    parts = [p.strip() for p in appt.preferredTherapist.split() if len(p.strip()) > 3]
+                    for part in parts:
+                        user_recs = await write_session.search_read(
+                            'res.users',
+                            [['name', 'ilike', part]],
+                            ['id', 'name', 'partner_id'],
+                            limit=1
+                        )
+                        if user_recs:
+                            break
+
                 if user_recs:
                     therapist_user_id = user_recs[0]['id']
                     pid = user_recs[0].get('partner_id')
                     therapist_partner_id = pid[0] if isinstance(pid, list) else pid
                     organizer_name = user_recs[0]['name']
-            except Exception:
-                pass
+                else:
+                    # 3. Recherche fallback dans res.partner
+                    partner_recs = await write_session.search_read(
+                        'res.partner',
+                        [['name', 'ilike', appt.preferredTherapist.strip()]],
+                        ['id', 'name', 'user_ids'],
+                        limit=1
+                    )
+                    if partner_recs:
+                        therapist_partner_id = partner_recs[0]['id']
+                        organizer_name = partner_recs[0]['name']
+                        uids = partner_recs[0].get('user_ids') or []
+                        if uids:
+                            therapist_user_id = uids[0]
+            except Exception as search_err:
+                print(f"[WARN] Erreur recherche thérapeute '{appt.preferredTherapist}': {search_err}")
 
         # ------------------------------------------------------------------ #
         # 4) Description HTML du rendez-vous
@@ -790,17 +823,28 @@ async def create_appointment(req: CreateAppointmentRequest, session: OdooSession
         notes_display  = appt.clientNotes or 'Aucun détail supplémentaire'
         format_display = 'Au bureau CAPSY - Goma' if (appt.format or 'presentiel') == 'presentiel' else 'Séance en ligne'
 
+        # La description contient :
+        #  • Section HTML visible dans Odoo (labels clairs, pas de "Organisé par")
+        #  • Lignes de métadonnées lisibles par le frontend React via regex
         description_html = (
             f"<div>"
+            f"<p><strong>👤 Demandeur (Client)</strong><br>"
+            f"{appt.clientName}<br>"
+            f"<a href=\"mailto:{email_display}\">{email_display}</a><br>"
+            f"<a href=\"tel:{phone_display.replace(' ', '%20')}\">{phone_display}</a></p>"
+            f"<p><strong>🩺 Praticien assigné</strong><br>"
+            f"{organizer_name}</p>"
+            f"<p><strong>📍 Format :</strong> {format_display}</p>"
+            f"<p><strong>📝 Notes :</strong> {notes_display}</p>"
+            f"<hr/>"
+            # Métadonnées machine-readable pour le parsing côté React (invisible dans Odoo)
+            f"<p style='font-size:0.01px;color:transparent;line-height:0;'>"
             f"Client: {appt.clientName}\n"
             f"Email: {email_display}\n"
             f"Phone: {phone_display}\n"
             f"Notes: {notes_display}\n"
             f"Therapist: {organizer_name}"
-            f"<br><strong>Organisé par</strong><br>"
-            f"{appt.clientName}<br>"
-            f"<a href=\"mailto:{email_display}\">{email_display}</a><br>"
-            f"<a href=\"tel:{phone_display.replace(' ', '%20')}\">{phone_display}</a>"
+            f"</p>"
             f"</div>"
         )
 
@@ -834,7 +878,31 @@ async def create_appointment(req: CreateAppointmentRequest, session: OdooSession
             event_vals['appointment_status'] = 'booked'
             event_vals['appointment_type_schedule_based_on'] = 'users'
 
-        event_id: int = await write_session.create('calendar.event', event_vals)
+        print(f"[DEBUG] Creating calendar.event with therapist_user_id={therapist_user_id}, therapist_partner_id={therapist_partner_id}, attendee_partner_ids={attendee_partner_ids}")
+        try:
+            event_id: int = await write_session.create('calendar.event', event_vals)
+            print(f"[DEBUG] Created calendar.event ID: {event_id}")
+        except Exception as e:
+            print(f"[ERROR] Failed creating calendar.event: {e}")
+            raise
+
+        # S'assurer que le thérapeute est explicitement rattaché et que l'événement apparaît sur son agenda
+        if therapist_partner_id:
+            try:
+                # 1. Forcer l'ajout dans partner_ids au cas où Odoo l'aurait écrasé
+                await write_session.write('calendar.event', [event_id], {
+                    'partner_ids': [[4, therapist_partner_id]]
+                })
+                # 2. Confirmer la présence du thérapeute (state = 'accepted') pour qu'il soit sur son calendrier
+                att_ids = await write_session.search(
+                    'calendar.attendee',
+                    [['event_id', '=', event_id], ['partner_id', '=', therapist_partner_id]]
+                )
+                if att_ids:
+                    await write_session.write('calendar.attendee', att_ids, {'state': 'accepted'})
+                    print(f"[DEBUG] Attendee thérapeute {therapist_partner_id} confirmé (accepted) sur event {event_id}")
+            except Exception as att_err:
+                print(f"[WARN] Erreur confirmation calendrier thérapeute : {att_err}")
 
         # ------------------------------------------------------------------ #
         # 6) Créer le dossier clinique dans le projet « Accompagnement individuel »
@@ -847,8 +915,18 @@ async def create_appointment(req: CreateAppointmentRequest, session: OdooSession
             proj_ids = await write_session.search('project.project', [['name', '=', PROJET_ACCOMPAGNEMENT]], limit=1)
             if not proj_ids:
                 proj_ids = await write_session.search('project.project', [['name', 'ilike', 'Accompagnement']], limit=1)
+            if not proj_ids:
+                # Chercher un projet alternatif existant
+                proj_ids = await write_session.search('project.project', [], limit=1)
             if proj_ids:
                 project_id = proj_ids[0]
+            else:
+                # Auto-créer le projet s'il n'existe pas
+                try:
+                    project_id = await write_session.create('project.project', {'name': PROJET_ACCOMPAGNEMENT})
+                    print(f"[INFO] Projet '{PROJET_ACCOMPAGNEMENT}' créé avec ID: {project_id}")
+                except Exception as create_p_err:
+                    print(f"[WARN] Impossible de créer le projet : {create_p_err}")
 
             dossier_description = (
                 f"<p><strong>Dossier client :</strong> {appt.clientName}</p>"
