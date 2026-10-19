@@ -189,29 +189,45 @@ class OdooSession:
         return data.get("result")
 
     # helpers CRUD (tous async)
-    async def search(self, model: str, domain: list, limit: int = 10) -> list:
-        return await self.call_kw(model, "search", [domain], {"limit": limit})
+    async def search(self, model: str, domain: list, limit: int = 10, context: Optional[dict] = None) -> list:
+        kwargs: Dict[str, Any] = {"limit": limit}
+        if context:
+            kwargs["context"] = context
+        return await self.call_kw(model, "search", [domain], kwargs)
 
-    async def read(self, model: str, ids: list, fields: Optional[list] = None) -> list:
+    async def read(self, model: str, ids: list, fields: Optional[list] = None, context: Optional[dict] = None) -> list:
         kwargs: Dict[str, Any] = {}
         if fields:
             kwargs["fields"] = fields
+        if context:
+            kwargs["context"] = context
         return await self.call_kw(model, "read", [ids], kwargs)
 
-    async def search_read(self, model: str, domain: list, fields: Optional[list], limit: int = 10) -> list:
+    async def search_read(self, model: str, domain: list, fields: Optional[list], limit: int = 10, context: Optional[dict] = None) -> list:
         kwargs: Dict[str, Any] = {"limit": limit}
         if fields:
             kwargs["fields"] = fields
+        if context:
+            kwargs["context"] = context
         return await self.call_kw(model, "search_read", [domain], kwargs)
 
-    async def fields_get(self, model: str) -> dict:
-        return await self.call_kw(model, "fields_get", [], {"attributes": ["type"]})
+    async def fields_get(self, model: str, context: Optional[dict] = None) -> dict:
+        kwargs: Dict[str, Any] = {"attributes": ["type"]}
+        if context:
+            kwargs["context"] = context
+        return await self.call_kw(model, "fields_get", [], kwargs)
 
-    async def create(self, model: str, vals: dict) -> int:
-        return await self.call_kw(model, "create", [vals], {})
+    async def create(self, model: str, vals: dict, context: Optional[dict] = None) -> int:
+        kwargs: Dict[str, Any] = {}
+        if context:
+            kwargs["context"] = context
+        return await self.call_kw(model, "create", [vals], kwargs)
 
-    async def write(self, model: str, ids: list, vals: dict) -> bool:
-        return await self.call_kw(model, "write", [ids, vals], {})
+    async def write(self, model: str, ids: list, vals: dict, context: Optional[dict] = None) -> bool:
+        kwargs: Dict[str, Any] = {}
+        if context:
+            kwargs["context"] = context
+        return await self.call_kw(model, "write", [ids, vals], kwargs)
 
 
 async def _authenticate(username: str, password: str, url: str, db: str) -> OdooSession:
@@ -538,8 +554,37 @@ CLINICAL_SUBTASKS = [
     "Archiver le dossier",
 ]
 
+# Contexte Odoo pour désactiver strictement toutes les notifications, emails et tracking
+# lors de la création automatisée des sous-tâches cliniques (mail.thread / mail.tracking)
+ODOO_SUBTASK_SILENT_CONTEXT: dict = {
+    'tracking_disable': True,              # Désactive complètement le tracking et les messages mail.thread
+    'mail_create_nosubscribe': True,       # N'abonne pas automatiquement le client ni le thérapeute comme followers
+    'mail_notrack': True,                  # Empêche la génération d'alertes de suivi sur modification des champs
+    'mail_create_nolog': True,             # Empêche l'enregistrement du log de création dans le chatter
+    'mail_auto_subscribe_no_notify': True, # Bloque tout email/notification lié à un abonnement automatique
+    'mail_post_autofollow': False,         # N'abonne aucun contact mentionné ou lié
+    'mail_notify_author': False,           # Ne notifie pas l'auteur de la tâche
+}
+
 # Nom du projet cible dans Odoo
 PROJET_ACCOMPAGNEMENT = "Accompagnement individuel"
+
+
+async def create_clinical_subtask(
+    session: OdooSession,
+    subtask_vals: dict,
+    extra_context: Optional[dict] = None
+) -> int:
+    """
+    Crée une sous-tâche clinique dans Odoo en injectant le contexte de blocage strict des notifications,
+    emails et messages de suivi (mail.thread / mail.tracking), tout en préservant le bon fonctionnement
+    et l'association de la sous-tâche à sa tâche parente.
+    """
+    ctx = dict(ODOO_SUBTASK_SILENT_CONTEXT)
+    if extra_context:
+        ctx.update(extra_context)
+    return await session.create('project.task', subtask_vals, context=ctx)
+
 
 
 async def get_available_therapists_helper(
@@ -995,7 +1040,7 @@ async def create_appointment(req: CreateAppointmentRequest, session: OdooSession
                 if therapist_user_id:
                     subtask_vals['user_ids'] = [[6, 0, [therapist_user_id]]]
                 try:
-                    sub_id = await write_session.create('project.task', subtask_vals)
+                    sub_id = await create_clinical_subtask(write_session, subtask_vals)
                     subtask_ids.append(sub_id)
                 except Exception as sub_err:
                     print(f"[WARN] Sous-tâche '{subtask_name}' non créée : {sub_err}")
