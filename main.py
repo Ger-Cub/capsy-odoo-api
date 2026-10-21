@@ -11,7 +11,7 @@ import os
 import re
 import json
 import httpx
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta, date as date_type
 try:
     from zoneinfo import ZoneInfo
 except Exception:
@@ -82,6 +82,7 @@ app.add_middleware(
         "https://capsy-services.vercel.app",
         "http://localhost:3000",
         "http://127.0.0.1:3000",
+        "http://0.0.0.0:3000",
         "http://localhost:5173",
         "http://127.0.0.1:5173",
     ],
@@ -272,6 +273,21 @@ async def get_odoo(auth: Optional[HTTPBasicCredentials] = Depends(security)) -> 
             headers={"WWW-Authenticate": "Basic"},
         )
     return await _authenticate(username, password, _ODOO_URL, _ODOO_DB)
+
+
+async def get_public_odoo() -> OdooSession:
+    """Dependency FastAPI pour routes publiques (consultation libre des rendez-vous et thérapeutes).
+    Utilise la connexion système Odoo configurée sur le serveur sans exiger d'authentification du client/visiteur.
+    """
+    username = os.getenv("ODOO_USERNAME")
+    password = os.getenv("ODOO_PASSWORD")
+    if not username or not password:
+        raise HTTPException(
+            status_code=500,
+            detail="Configuration Odoo du serveur manquante (variables ODOO_USERNAME/ODOO_PASSWORD requises).",
+        )
+    return await _authenticate(username, password, _ODOO_URL, _ODOO_DB)
+
 
 
 # --- Endpoint de Connexion ---
@@ -615,10 +631,32 @@ async def get_available_therapists_helper(
         except Exception as e:
             print(f"[WARN] Erreur lors de la recherche des therapeutes du service '{service_title}': {e}")
 
+    # Si aucun type de service spécifique n'est spécifié, restreindre à l'ensemble des praticiens de tous les types de RDV
+    if not allowed_uids:
+        all_therapist_uids = set()
+        for model_name in ['appointment.type', 'calendar.appointment.type']:
+            try:
+                types = await session.search_read(
+                    model_name,
+                    [['active', '=', True]],
+                    ['id', 'name', 'staff_user_ids'],
+                    limit=100
+                )
+                for t in types:
+                    for uid in (t.get('staff_user_ids') or []):
+                        all_therapist_uids.add(uid)
+                if types:
+                    break
+            except Exception:
+                continue
+        allowed_uids = list(all_therapist_uids)
+
+    # Sécurité absolue : si aucun praticien habilité n'est trouvé, ne jamais renvoyer d'utilisateurs non-thérapeutes
+    if not allowed_uids:
+        return {'available': [], 'busy': [], 'total': 0}
+
     try:
-        domain = [['active', '=', True], ['share', '=', False]]
-        if allowed_uids:
-            domain.append(['id', 'in', allowed_uids])
+        domain = [['active', '=', True], ['share', '=', False], ['id', 'in', allowed_uids]]
 
         user_records = await session.search_read(
             'res.users',
@@ -679,7 +717,7 @@ async def check_therapists_availability(
     date: str,
     timeSlot: str,
     service_title: Optional[str] = None,
-    session: OdooSession = Depends(get_odoo),
+    session: OdooSession = Depends(get_public_odoo),
 ):
     times = timeSlot.split(' - ')
     start_str = times[0].strip().replace('h', ':') + ':00'
@@ -693,7 +731,7 @@ async def check_therapists_availability(
 @app.post('/appointments', tags=["Rendez-vous"], include_in_schema=False)
 @app.post('/appointments/', tags=["Rendez-vous"], include_in_schema=False)
 @app.post('/appointments/create', tags=["Rendez-vous"], summary="Créer un rendez-vous complet (contact + calendrier + dossier clinique)")
-async def create_appointment(req: CreateAppointmentRequest, session: OdooSession = Depends(get_odoo)):
+async def create_appointment(req: CreateAppointmentRequest, session: OdooSession = Depends(get_public_odoo)):
     """
     Flux complet de création d'un rendez-vous CAPSY :
 
@@ -1101,7 +1139,7 @@ async def list_appointments(
     session: OdooSession = Depends(get_odoo),
 ):
     try:
-        from datetime import datetime, timezone
+        from datetime import datetime, timezone, timedelta, date as date_type
 
         admin_user = os.getenv("ODOO_USERNAME")
         admin_pass = os.getenv("ODOO_PASSWORD")
@@ -1174,6 +1212,15 @@ APPT_TYPE_FIELDS = [
     'schedule_based_on', 'location_id', 'location',
     'staff_user_ids',
     'appointment_count', 'appointment_count_report',
+    'message_intro',
+    'min_schedule_hours',
+    'max_schedule_days',
+    'min_cancellation_hours',
+    'appointment_tz',
+    'slot_ids',
+    'question_ids',
+    # Champs de publication website (présents selon version Odoo)
+    'website_published', 'is_published',
 ]
 
 @app.get(
@@ -1181,15 +1228,15 @@ APPT_TYPE_FIELDS = [
     tags=["Rendez-vous"],
     summary="Lister les types de rendez-vous Odoo (module Rendez-vous)",
     description="""
-Retourne les types de rendez-vous (`appointment.type` ou `calendar.appointment.type`) publiés,
-équivalent à la page `https://testjack.odoo.com/odoo/appointments`.
+Retourne uniquement les types de rendez-vous **publiés** (`website_published = True`),
+correspondant exactement à la vue "Partager" de `capsy1.odoo.com/odoo/appointments`.
 """
 )
 async def list_appointment_types(
     limit: int = 50,
-    session: OdooSession = Depends(get_odoo),
+    session: OdooSession = Depends(get_public_odoo),
 ):
-    """Retourne les types de rendez-vous publiés."""
+    """Retourne les types de rendez-vous publiés (website_published=True), miroir exact du module Odoo."""
     model_names = ['appointment.type', 'calendar.appointment.type']
     last_error = None
 
@@ -1199,9 +1246,24 @@ async def list_appointment_types(
             available_fields = await session.fields_get(model)
             fields_to_read = [f for f in APPT_TYPE_FIELDS if f in available_fields]
 
+            # Déterminer le champ de publication selon la version d'Odoo
+            # Odoo 16+ : website_published | Odoo 17+ : is_published
+            publish_field = None
+            if 'website_published' in available_fields:
+                publish_field = 'website_published'
+            elif 'is_published' in available_fields:
+                publish_field = 'is_published'
+
+            # Construire le domaine : actif ET publié sur le site web
+            if publish_field:
+                domain = [['active', '=', True], [publish_field, '=', True]]
+            else:
+                # Fallback : si pas de champ de publication connu, prendre tous les actifs
+                domain = [['active', '=', True]]
+
             records = await session.search_read(
                 model,
-                [['active', '=', True]],
+                domain,
                 fields_to_read,
                 limit=limit,
             )
@@ -1211,6 +1273,309 @@ async def list_appointment_types(
             continue
 
     raise HTTPException(status_code=400, detail=f"Erreur lecture types de rendez-vous: {str(last_error)}")
+
+
+@app.get(
+    '/appointments/types/{type_id}/details',
+    tags=["Rendez-vous"],
+    summary="Détails complets d'un type de rendez-vous (descriptif, questions, disponibilités, options)",
+    description="""
+Retourne la fiche détaillée d'un type de rendez-vous Odoo :
+- Descriptif officiel HTML (`message_intro`)
+- Durée et fuseau horaire
+- Questions dynamiques configurées avec options de réponse (`appointment.question` + `appointment.answer`)
+- Plages horaires hebdomadaires configurées (`appointment.slot`)
+- Délais minimums et maximums de réservation
+"""
+)
+async def get_appointment_type_details(
+    type_id: int,
+    session: OdooSession = Depends(get_public_odoo),
+):
+    model_names = ['appointment.type', 'calendar.appointment.type']
+    target_rec = None
+    used_model = None
+
+    for model in model_names:
+        try:
+            available_fields = await session.fields_get(model)
+            fields_to_read = [f for f in APPT_TYPE_FIELDS if f in available_fields]
+            recs = await session.read(model, [type_id], fields_to_read)
+            if recs:
+                target_rec = recs[0]
+                used_model = model
+                break
+        except Exception:
+            continue
+
+    if not target_rec:
+        raise HTTPException(status_code=404, detail=f"Type de rendez-vous {type_id} introuvable.")
+
+    # 1. Récupérer les questions dynamiques et leurs options
+    questions_list = []
+    q_ids = target_rec.get('question_ids') or []
+    if q_ids:
+        try:
+            raw_questions = await session.read(
+                'appointment.question',
+                q_ids,
+                ['id', 'name', 'question_type', 'question_required', 'answer_ids']
+            )
+            all_ans_ids = [aid for q in (raw_questions or []) for aid in (q.get('answer_ids') or [])]
+            answers_map = {}
+            if all_ans_ids:
+                try:
+                    raw_answers = await session.read('appointment.answer', all_ans_ids, ['id', 'name', 'sequence'])
+                    for a in (raw_answers or []):
+                        answers_map[a['id']] = a
+                except Exception as e:
+                    print(f"[WARN] Erreur lecture appointment.answer: {e}")
+
+            for q in (raw_questions or []):
+                q_answers = []
+                for aid in (q.get('answer_ids') or []):
+                    if aid in answers_map:
+                        q_answers.append({
+                            'id': aid,
+                            'name': answers_map[aid].get('name', ''),
+                            'sequence': answers_map[aid].get('sequence', 0)
+                        })
+                questions_list.append({
+                    'id': q['id'],
+                    'name': q.get('name'),
+                    'question_type': q.get('question_type'),
+                    'question_required': bool(q.get('question_required')),
+                    'answers': q_answers,
+                })
+        except Exception as e:
+            print(f"[WARN] Erreur lecture appointment.question: {e}")
+
+    # 2. Récupérer les règles de créneaux (appointment.slot)
+    slots_list = []
+    slot_ids = target_rec.get('slot_ids') or []
+    if slot_ids:
+        try:
+            raw_slots = await session.read(
+                'appointment.slot',
+                slot_ids,
+                ['id', 'weekday', 'start_hour', 'end_hour', 'restrict_to_user_ids']
+            )
+            for s in (raw_slots or []):
+                slots_list.append({
+                    'id': s['id'],
+                    'weekday': s.get('weekday'),
+                    'start_hour': s.get('start_hour'),
+                    'end_hour': s.get('end_hour'),
+                    'restrict_to_user_ids': s.get('restrict_to_user_ids') or [],
+                })
+        except Exception as e:
+            print(f"[WARN] Erreur lecture appointment.slot: {e}")
+
+    return {
+        'id': target_rec['id'],
+        'name': target_rec.get('name'),
+        'appointment_duration': target_rec.get('appointment_duration', 1.0),
+        'duration': target_rec.get('appointment_duration', 1.0),
+        'appointment_tz': target_rec.get('appointment_tz', 'Africa/Kinshasa'),
+        'timezone': target_rec.get('appointment_tz', 'Africa/Kinshasa'),
+        'message_intro': target_rec.get('message_intro') or '',
+        'description_html': target_rec.get('message_intro') or '',
+        'min_schedule_hours': target_rec.get('min_schedule_hours', 24.0),
+        'max_schedule_days': target_rec.get('max_schedule_days', 15),
+        'min_cancellation_hours': target_rec.get('min_cancellation_hours', 1.0),
+        'staff_user_ids': target_rec.get('staff_user_ids') or [],
+        'location': target_rec.get('location') or '',
+        'questions': questions_list,
+        'slots_config': slots_list,
+    }
+
+
+@app.get(
+    '/appointments/available-slots',
+    tags=["Rendez-vous"],
+    summary="Calculer les créneaux disponibles pour une date et un thérapeute",
+    description="""
+Génère en temps réel les créneaux libres pour un type de RDV, une date donnée (YYYY-MM-DD),
+et éventuellement un thérapeute sélectionné. Déduit automatiquement les RDV déjà réservés (calendar.event).
+"""
+)
+async def get_available_slots(
+    appointment_type_id: int,
+    date: str,  # Format 'YYYY-MM-DD'
+    therapist_user_id: Optional[int] = None,
+    session: OdooSession = Depends(get_public_odoo),
+):
+    try:
+        target_date = datetime.strptime(date.strip(), "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Format de date invalide. Format attendu : YYYY-MM-DD")
+
+    # 1. Lire les paramètres du type de rendez-vous
+    model_names = ['appointment.type', 'calendar.appointment.type']
+    target_rec = None
+    for model in model_names:
+        try:
+            available_fields = await session.fields_get(model)
+            fields_to_read = [f for f in APPT_TYPE_FIELDS if f in available_fields]
+            recs = await session.read(model, [appointment_type_id], fields_to_read)
+            if recs:
+                target_rec = recs[0]
+                break
+        except Exception:
+            continue
+
+    if not target_rec:
+        raise HTTPException(status_code=404, detail=f"Type de rendez-vous {appointment_type_id} introuvable.")
+
+    duration = float(target_rec.get('appointment_duration') or 1.0)
+    min_notice_hours = float(target_rec.get('min_schedule_hours') or 0.0)
+    max_days = int(target_rec.get('max_schedule_days') or 30)
+    staff_user_ids = target_rec.get('staff_user_ids') or []
+    tz_name = target_rec.get('appointment_tz') or "Africa/Kinshasa"
+
+    # Vérifier l'horizon de réservation (max_schedule_days)
+    today = datetime.now().date()
+    if target_date < today:
+        return {"date": date, "available": False, "slots": [], "reason": "Date dans le passé"}
+    if (target_date - today).days > max_days:
+        return {"date": date, "available": False, "slots": [], "reason": f"Réservations limitées à {max_days} jours"}
+
+    # 2. Récupérer les règles de créneaux pour ce jour de la semaine
+    # target_date.isoweekday(): 1=Lundi, ..., 7=Dimanche
+    iso_weekday = str(target_date.isoweekday())
+    slot_ids = target_rec.get('slot_ids') or []
+    if not slot_ids:
+        return {"date": date, "available": False, "slots": [], "reason": "Aucun créneau configuré"}
+
+    matching_rules = []
+    try:
+        raw_slots = await session.read(
+            'appointment.slot',
+            slot_ids,
+            ['id', 'weekday', 'start_hour', 'end_hour', 'restrict_to_user_ids']
+        )
+        for s in (raw_slots or []):
+            if str(s.get('weekday')) == iso_weekday:
+                matching_rules.append(s)
+    except Exception as e:
+        print(f"[WARN] Erreur lecture appointment.slot: {e}")
+
+    if not matching_rules:
+        return {"date": date, "available": False, "slots": [], "reason": "Aucune consultation ce jour de la semaine"}
+
+    # Filtrer les thérapeutes applicables
+    if therapist_user_id and therapist_user_id in staff_user_ids:
+        relevant_therapist_ids = [therapist_user_id]
+    else:
+        relevant_therapist_ids = staff_user_ids
+
+    # 3. Interroger les rendez-vous existants (calendar.event) sur cette date
+    busy_events = []
+    try:
+        start_search = f"{date} 00:00:00"
+        end_search = f"{date} 23:59:59"
+        domain = [
+            ['start', '<=', end_search],
+            ['stop', '>=', start_search],
+        ]
+        if relevant_therapist_ids:
+            domain.append(['user_id', 'in', relevant_therapist_ids])
+
+        busy_events = await session.search_read(
+            'calendar.event',
+            domain,
+            ['id', 'start', 'stop', 'user_id'],
+            limit=100
+        )
+    except Exception as e:
+        print(f"[WARN] Erreur lecture calendar.event pour conflits: {e}")
+
+    # 4. Générer les créneaux horaires
+    slots_result = []
+    seen_slots = set()
+    now_utc = datetime.now(timezone.utc)
+    # Décalage Kinshasa (UTC+1)
+    tz_offset_hours = 1
+
+    matching_rules.sort(key=lambda r: float(r.get('start_hour') or 0))
+
+    for rule in matching_rules:
+        restricted = rule.get('restrict_to_user_ids') or []
+        if therapist_user_id and restricted and therapist_user_id not in restricted:
+            continue
+
+        start_h = float(rule.get('start_hour') or 0)
+        end_h = float(rule.get('end_hour') or 0)
+        curr = start_h
+
+        while curr + duration <= end_h + 0.001:
+            sh = int(curr)
+            sm = int(round((curr % 1) * 60))
+            eh = int(curr + duration)
+            em = int(round(((curr + duration) % 1) * 60))
+
+            slot_label = f"{sh:02d}h{sm:02d} - {eh:02d}h{em:02d}"
+            start_time_str = f"{sh:02d}:{sm:02d}"
+            end_time_str = f"{eh:02d}:{em:02d}"
+
+            if slot_label not in seen_slots:
+                seen_slots.add(slot_label)
+
+                # Heure UTC correspondante pour le créneau
+                slot_start_naive = datetime(target_date.year, target_date.month, target_date.day, sh, sm)
+                slot_end_naive = datetime(target_date.year, target_date.month, target_date.day, eh, em)
+                slot_start_utc = slot_start_naive - timedelta(hours=tz_offset_hours)
+                slot_end_utc = slot_end_naive - timedelta(hours=tz_offset_hours)
+
+                # Vérifier min_notice_hours
+                hours_until_slot = (slot_start_utc.replace(tzinfo=timezone.utc) - now_utc).total_seconds() / 3600.0
+                is_too_soon = hours_until_slot < min_notice_hours
+
+                # Vérifier la disponibilité des thérapeutes pour ce créneau
+                free_therapists = []
+                for tid in relevant_therapist_ids:
+                    if restricted and tid not in restricted:
+                        continue
+
+                    is_busy = False
+                    for ev in busy_events:
+                        ev_user_id = ev.get('user_id')
+                        ev_uid = ev_user_id[0] if isinstance(ev_user_id, (list, tuple)) else ev_user_id
+                        if ev_uid == tid:
+                            try:
+                                ev_start = datetime.strptime(str(ev.get('start')), "%Y-%m-%d %H:%M:%S")
+                                ev_stop = datetime.strptime(str(ev.get('stop')), "%Y-%m-%d %H:%M:%S")
+                                if ev_start < slot_end_utc and ev_stop > slot_start_utc:
+                                    is_busy = True
+                                    break
+                            except Exception:
+                                pass
+                    if not is_busy:
+                        free_therapists.append(tid)
+
+                is_available = (not is_too_soon) and (len(free_therapists) > 0)
+
+                slots_result.append({
+                    "slot": slot_label,
+                    "startTime": start_time_str,
+                    "endTime": end_time_str,
+                    "available": is_available,
+                    "freeTherapistsCount": len(free_therapists),
+                    "reason": "Délai minimum non respecté" if is_too_soon else ("Complet" if len(free_therapists) == 0 else None)
+                })
+
+            curr += duration
+
+    return {
+        "date": date,
+        "available": any(s.get("available") for s in slots_result),
+        "appointment_type_id": appointment_type_id,
+        "therapist_user_id": therapist_user_id,
+        "timezone": tz_name,
+        "duration_hours": duration,
+        "min_notice_hours": min_notice_hours,
+        "slots": slots_result
+    }
 
 
 @app.get(
@@ -1225,7 +1590,7 @@ Si `appointment_type_id` ou `service_title` est fourni, seuls les thérapeutes r
 async def list_therapists(
     appointment_type_id: Optional[int] = None,
     service_title: Optional[str] = None,
-    session: OdooSession = Depends(get_odoo),
+    session: OdooSession = Depends(get_public_odoo),
 ):
     """Retourne les thérapeutes Odoo avec leurs images d'avatar (filtrés par type de rendez-vous si spécifié)."""
     try:
@@ -1282,12 +1647,32 @@ async def list_therapists(
                 except Exception:
                     continue
 
-        # Domaine de recherche sur res.users
-        domain = [['share', '=', False], ['active', '=', True]]
-        if allowed_user_ids is not None:
-            if not allowed_user_ids:
-                return []
-            domain.append(['id', 'in', allowed_user_ids])
+        # Si aucun type spécifique n'a été ciblé, rassembler les staff_user_ids de TOUS les types de rendez-vous
+        if allowed_user_ids is None:
+            all_therapist_uids = set()
+            for model_name in ['appointment.type', 'calendar.appointment.type']:
+                try:
+                    types = await session.search_read(
+                        model_name,
+                        [['active', '=', True]],
+                        ['id', 'name', 'staff_user_ids'],
+                        limit=100
+                    )
+                    for t in types:
+                        for uid in (t.get('staff_user_ids') or []):
+                            all_therapist_uids.add(uid)
+                    if types:
+                        break
+                except Exception:
+                    continue
+            allowed_user_ids = list(all_therapist_uids)
+
+        # Sécurité absolue : si aucun praticien/thérapeute n'est habilité, ne renvoyer aucun profil
+        if not allowed_user_ids:
+            return []
+
+        # Domaine de recherche sur res.users : strictement limité aux staff_user_ids des rendez-vous
+        domain = [['share', '=', False], ['active', '=', True], ['id', 'in', allowed_user_ids]]
 
         users = await session.search_read(
             'res.users',
