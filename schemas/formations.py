@@ -1,22 +1,18 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 from typing import List, Optional
 
 
 class CompetenceSchema(BaseModel):
     name: str = Field(..., alias="x_name")
 
-    class Config:
-        populate_by_name = True
-        allow_population_by_field_name = True
+    model_config = ConfigDict(populate_by_name=True, from_attributes=True)
 
 
 class SignataireSchema(BaseModel):
     name: str = Field(..., alias="x_name")
     role: str = Field(..., alias="x_studio_role")
 
-    class Config:
-        populate_by_name = True
-        allow_population_by_field_name = True
+    model_config = ConfigDict(populate_by_name=True, from_attributes=True)
 
 
 class ParticipantSchema(BaseModel):
@@ -24,9 +20,7 @@ class ParticipantSchema(BaseModel):
     name: str = Field(..., alias="x_name")
     title: str = Field(..., alias="x_studio_titre_professionnel")
 
-    class Config:
-        populate_by_name = True
-        allow_population_by_field_name = True
+    model_config = ConfigDict(populate_by_name=True, from_attributes=True)
 
 
 class FormationSchema(BaseModel):
@@ -44,7 +38,4 @@ class FormationSchema(BaseModel):
     signataires: List[SignataireSchema] = Field(default_factory=list, alias="x_studio_signataires")
     participants: List[ParticipantSchema] = Field(default_factory=list, alias="x_studio_participant_ids")
 
-    class Config:
-        populate_by_name = True
-        allow_population_by_field_name = True
-        orm_mode = True
+    model_config = ConfigDict(populate_by_name=True, from_attributes=True)
