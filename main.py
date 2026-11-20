@@ -10,6 +10,7 @@ from typing import List, Optional, Dict, Any
 import os
 import re
 import json
+import html
 import httpx
 from datetime import datetime, timezone, timedelta, date as date_type
 try:
@@ -129,6 +130,21 @@ class SessionCallRequest(BaseModel):
     kwargs: Optional[Dict[str, Any]] = None
     db: Optional[str] = None
     url: Optional[str] = None
+
+class ContactMessageRequest(BaseModel):
+    name: str
+    email: str
+    phone: Optional[str] = None
+    message: str
+    request_id: Optional[str] = None
+    page_source: Optional[str] = None
+    honeypot: Optional[str] = None
+
+class ContactMessageResponse(BaseModel):
+    success: bool
+    lead_id: Optional[int] = None
+    partner_id: Optional[int] = None
+    message: str
 
 # ---------------------------------------------------------------------------
 # OdooSession — couche JSON-RPC native async (remplace OdooRPC)
@@ -1703,6 +1719,169 @@ async def list_therapists(
         return therapists
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Erreur lecture thérapeutes: {str(exc)}")
+
+
+# Cache d'idempotence pour éviter les doubles soumissions de contact
+_CONTACT_IDEMPOTENCY_CACHE: Dict[str, Dict[str, Any]] = {}
+_EMAIL_REGEX = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+@app.post(
+    "/crm/contact-message",
+    tags=["🤝 CRM"],
+    response_model=ContactMessageResponse,
+    summary="Enregistrer un message du formulaire de contact dans le CRM Odoo (crm.lead + res.partner)",
+)
+async def create_contact_message(
+    payload: ContactMessageRequest,
+    session: OdooSession = Depends(get_public_odoo)
+):
+    """Enregistre un message reçu depuis le formulaire web dans le CRM Odoo :
+    1. Vérifie le honeypot (protection anti-bot).
+    2. Valide les contraintes strictes de format et de taille.
+    3. Gère l'idempotence via `request_id`.
+    4. Recherche un `res.partner` existant par e-mail, ou en crée un nouveau.
+    5. Crée un enregistrement `crm.lead` de type « lead » associé au partenaire,
+       avec le message échappé et les métadonnées de soumission.
+    """
+    # 1. Protection Anti-bot basique (honeypot)
+    if payload.honeypot and payload.honeypot.strip():
+        return ContactMessageResponse(
+            success=True,
+            lead_id=None,
+            partner_id=None,
+            message="Votre message a été transmis avec succès."
+        )
+
+    # 2. Validation stricte des données d'entrée
+    clean_name = (payload.name or "").strip()
+    if len(clean_name) < 2 or len(clean_name) > 100:
+        raise HTTPException(status_code=400, detail="Le nom doit contenir entre 2 et 100 caractères.")
+
+    clean_email = (payload.email or "").strip().lower()
+    if not clean_email or len(clean_email) > 254 or not _EMAIL_REGEX.match(clean_email):
+        raise HTTPException(status_code=400, detail="Veuillez fournir une adresse e-mail valide.")
+
+    clean_message = (payload.message or "").strip()
+    if len(clean_message) < 5 or len(clean_message) > 5000:
+        raise HTTPException(status_code=400, detail="Le message doit contenir entre 5 et 5000 caractères.")
+
+    clean_phone = (payload.phone or "").strip() if payload.phone else ""
+    if clean_phone and len(clean_phone) > 30:
+        raise HTTPException(status_code=400, detail="Le numéro de téléphone ne doit pas dépasser 30 caractères.")
+
+    # 3. Idempotence via request_id
+    req_id = (payload.request_id or "").strip()
+    if req_id and req_id in _CONTACT_IDEMPOTENCY_CACHE:
+        cached = _CONTACT_IDEMPOTENCY_CACHE[req_id]
+        return ContactMessageResponse(**cached)
+
+    try:
+        # 4. Étape Partner : search res.partner par email (insensible à la casse)
+        partner_ids = await session.search("res.partner", [["email", "=ilike", clean_email]], limit=1)
+        partner_id = None
+
+        if partner_ids:
+            partner_id = partner_ids[0]
+            # Si le partenaire n'a pas encore de téléphone et qu'un numéro est fourni, mise à jour douce
+            if clean_phone:
+                try:
+                    p_info = await session.read("res.partner", [partner_id], fields=["phone", "mobile"])
+                    if p_info and not p_info[0].get("phone") and not p_info[0].get("mobile"):
+                        await session.write("res.partner", [partner_id], {"phone": clean_phone})
+                except Exception as _pe:
+                    print(f"[CRM] Soft partner phone update skipped: {_pe}")
+        else:
+            # Création du partenaire
+            partner_vals = {
+                "name": clean_name,
+                "email": clean_email,
+                "comment": "Créé via le formulaire « Écrivez-nous un message » du site web https://www.capsy-rdc.org",
+            }
+            if clean_phone:
+                partner_vals["phone"] = clean_phone
+            partner_id = await session.create("res.partner", partner_vals)
+
+        # 5. Recherche source UTM (« Site web », « Website », ou « Search engine »)
+        source_id = None
+        try:
+            src_records = await session.search(
+                "utm.source",
+                ["|", ["name", "ilike", "Site web"], ["name", "ilike", "Search engine"]],
+                limit=1
+            )
+            if src_records:
+                source_id = src_records[0]
+        except Exception as _se:
+            print(f"[CRM] utm.source resolution notice: {_se}")
+
+        # 6. Échappement HTML et formatage des métadonnées
+        safe_msg = html.escape(clean_message).replace("\n", "<br/>")
+        safe_name = html.escape(clean_name)
+        safe_email = html.escape(clean_email)
+        safe_phone = html.escape(clean_phone) if clean_phone else "Non communiqué"
+        safe_page = html.escape(payload.page_source or "/#contact")
+        safe_req_id = html.escape(req_id or "N/A")
+        now_str = datetime.now(timezone.utc).strftime("%d/%m/%Y à %H:%M:%S UTC")
+
+        description_html = f"""<div>
+<p style="font-size: 14px; line-height: 1.6; color: #1f2937;"><strong>Message transmis par le visiteur :</strong><br/>{safe_msg}</p>
+<hr style="margin: 16px 0; border: none; border-top: 1px solid #e5e7eb;"/>
+<div style="font-size: 12px; color: #4b5563; background: #f9fafb; padding: 12px; border-radius: 8px; border: 1px solid #e5e7eb;">
+<p style="margin: 0 0 8px 0; font-weight: bold; color: #111827;">📋 Métadonnées d'origine (Formulaire Web CAPSY) :</p>
+<ul style="margin: 0; padding-left: 20px; line-height: 1.5;">
+<li><strong>Nom complet :</strong> {safe_name}</li>
+<li><strong>E-mail :</strong> {safe_email}</li>
+<li><strong>Téléphone :</strong> {safe_phone}</li>
+<li><strong>Type de demande :</strong> Demande d'information / Contact web</li>
+<li><strong>Page source :</strong> {safe_page}</li>
+<li><strong>Date &amp; Heure de soumission :</strong> {now_str}</li>
+<li><strong>Identifiant de requête (idempotence) :</strong> {safe_req_id}</li>
+</ul>
+</div>
+</div>"""
+
+        # 7. Création de crm.lead
+        lead_vals: Dict[str, Any] = {
+            "name": f"Demande de contact - {clean_name}",
+            "type": "lead",
+            "contact_name": clean_name,
+            "email_from": clean_email,
+            "partner_id": partner_id,
+            "description": description_html,
+        }
+        if clean_phone:
+            lead_vals["phone"] = clean_phone
+        if source_id:
+            lead_vals["source_id"] = source_id
+
+        lead_id = await session.create("crm.lead", lead_vals)
+
+        response_data = {
+            "success": True,
+            "lead_id": lead_id,
+            "partner_id": partner_id,
+            "message": "Votre message a bien été transmis à l'équipe CAPSY Services."
+        }
+
+        # Mise en cache idempotence
+        if req_id:
+            _CONTACT_IDEMPOTENCY_CACHE[req_id] = response_data
+            if len(_CONTACT_IDEMPOTENCY_CACHE) > 1000:
+                oldest_keys = list(_CONTACT_IDEMPOTENCY_CACHE.keys())[:200]
+                for k in oldest_keys:
+                    _CONTACT_IDEMPOTENCY_CACHE.pop(k, None)
+
+        return ContactMessageResponse(**response_data)
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        print(f"[CRM ERROR] Échec création lead/partner: {exc}")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Impossible d'enregistrer votre message dans le CRM Odoo pour le moment: {str(exc)}"
+        )
     """Teste l'authentification et un appel simple `fields_get`/`search_read` pour diagnostiquer 404/erreurs.
     Retourne le résultat ou l'erreur détaillée.
     """
